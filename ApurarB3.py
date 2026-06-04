@@ -1,0 +1,2749 @@
+"""
+CALCULO DE RESULTADOS DE AÇÕES - APURAÇÃO MENSAL B3.
+
+RESUMO:
+- Lê notas de corretagem em PDF de uma pasta específica (uma pasta por mês do ano, ex.: .../2025/01.25).
+- Usa a biblioteca CorrePy como parser principal (padrão B3 Sinacor).
+- Para notas fora do padrão CorrePy, usa um parser próprio com pdfplumber (Camada 2).
+- Classifica as operações em Day Trade, Swing Trade e FIIs.
+- Detecta o tipo do ativo (ON, PN, FII, BDR, UNITS e ETF) pela descrição; pergunta ao usuário quando não identificado automaticamente.
+- Separa o resultado de swing por tipo para aplicar a regra de isenção de 20k (apenas ON e PN são elegíveis à isenção).
+- O resultado de day trade é calculado separadamente, sem isenção independentemente do tipo de ativo.
+- Calcula os resultados líquidos por tipo de operação, considerando taxas e IRRF.
+- Atualiza a planilha Excel padrão com o resultado da apuração mensal.
+- Monta a carteira final do mês e grava em uma nova aba "CARTEIRA_MM.AA".
+- Permite exportar um Excel de debug (memória de cálculo) com todas as operações lidas.
+
+REGRAS DE TIPO DE ATIVO E ISENÇÃO:
+    ON  (Ordinária)    → TEM isenção 20k  → células B15 + G20 (se ≥20k) e células J20 e G20 (se <20k)
+    PN  (Preferencial) → TEM isenção 20k  → células B15 + G20 (se ≥20k) e células J20 e G20 (se <20k)
+    FII / FIAGRO       → NÃO tem isenção  → vai para B49 diretamente 
+    BDR / DRN          → NÃO tem isenção  → vai para B15 diretamente
+    UNITS / UNT / UN   → NÃO tem isenção  → vai para B15 diretamente
+    ETF                → NÃO tem isenção  → vai para B15 diretamente
+
+REGRAS DE CÁLCULO DE RESULTADO E APURAÇÃO:
+    - Soma as VENDAS de ON+PN do mês:
+   Se total de vendas ON+PN < R$20.000 → lucro vai para J20 (ganho isento).
+   Se total de vendas ON+PN ≥ R$20.000 → lucro vai para B15 (tributável a 15%).
+    - Independente da regra acima - BDR, UNITS e ETF sempre vão para B15 sem isenção (tributável a 15%).
+    - Independente da regra acima - FIIs sempre vão para B49 com sem isenção (tributável a 20%).
+    - O resultado final da apuração mensal é a soma de B15 (lucro tributável -> ON+PN+BDR+UNITS+ETF) + B49 (lucro FII)
+    - Em G20 ficam o total de alienações dentro do mês ON+PN+BDR+UNITS+ETF.
+
+REGRAS DE PARSER EM CAMADAS:
+    1ª Camada → CorrePy  (tenta identificar o padrão SINACOR CorrePy)
+    2ª Camada → Parser próprio com pdfplumber  (para layouts de corretoras específicas)
+    Se nenhuma camada funcionar, lança RuntimeError com mensagem detalhada.
+"""
+
+import io
+import os
+import re
+import tkinter as tk
+import openpyxl
+import traceback
+import fitz
+import sys
+import json
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
+from copy import deepcopy
+from datetime import date
+from typing import Callable, Dict, List, Optional, Tuple
+from tkinter import filedialog, messagebox
+from PIL import Image, ImageTk
+from correpy.parsers.brokerage_notes.parser_factory import ParserFactory
+from correpy.parsers.exceptions import InvalidPasswordException
+
+# pdfplumber é usado pelo parser da Camada 2 (layouts não-CorrePy)
+try:
+    import pdfplumber
+    _PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    _PDFPLUMBER_AVAILABLE = False
+
+
+###############################################################################
+# CONSTANTES DE TIPO DE ATIVO
+###############################################################################
+
+# Identificadores canônicos de tipo de ativo usados internamente.
+# Esses valores são gravados no campo `asset_type` de cada Operation.
+ASSET_TYPE_ON     = "ON"      # Ação ordinária                → tem isenção, 15% swing
+ASSET_TYPE_PN     = "PN"      # Ação preferencial             → tem isenção, 15% swing
+ASSET_TYPE_FII    = "FII"     # Fundo Imobiliário             → sem isenção, 20% swing
+ASSET_TYPE_FIAGRO = "FIAGRO"  # Fundo Agroindustrial          → sem isenção, 20% swing
+ASSET_TYPE_BDR    = "BDR"     # Brazilian Depositary Receipt  → sem isenção, 15% swing
+ASSET_TYPE_UNITS  = "UNITS"   # Units                         → sem isenção, 15% swing
+ASSET_TYPE_ETF    = "ETF"     # Exchange Traded Fund          → sem isenção, 15% swing
+
+# Conjunto de tipos que NÃO têm isenção de 20k
+ASSET_TYPES_SEM_ISENCAO = {
+    ASSET_TYPE_FII, ASSET_TYPE_FIAGRO,
+    ASSET_TYPE_BDR, ASSET_TYPE_UNITS, ASSET_TYPE_ETF,
+}
+
+# Conjunto de tipos que TÊM isenção de 20k (ON e PN)
+ASSET_TYPES_COM_ISENCAO = {ASSET_TYPE_ON, ASSET_TYPE_PN}
+
+# Limite de isenção mensal de IR para ON e PN (R$ 20.000,00 em vendas)
+LIMITE_ISENCAO_ON_PN = Decimal("20000.00")
+
+# Lista de 112 tickers de ETFs conhecidos para detecção automática (sem necessidade de perguntar ao usuário).
+# Lista exportada do site da B3 "https://www.b3.com.br/pt_br/produtos-e-servicos/negociacao/renda-variavel/etf/renda-variavel/etfs-listados/" 
+ETF_TICKERS_CONHECIDOS = {
+    "ACWI11", "AGRI11", "ALUG11", "ARGE11", "AURO11", "AUVP11", "B3BR11", "BBOI11", "BBOV11", "BBSD11", "BCIC11", "BDEF11", "BDOM11", "BEST11", "BIZD11", "BMMT11", "BOVA11", "BOVB11", "BOVS11", "BOVV11", "BOVX11", "BRAX11", "BRAZ11", "BREW11", "BRXC11", "BULZ11", "BVBR11", "BXPO11", "CAPE11", "CASA11", "CHIP11", "CMDB11", "COIN11", "CORN11", "DIVD11", "DIVO11", "DOLA11", "DOLB11", "DOLX11", "DVER11", "ECOO11", "ELAS11", "ESGB11", "EWBZ11", "FIND11", "FIXX11", "GDIV11", "GENB11", "GLDI11", "GLDX11", "GOLB11", "GOLD11", "GOLX11", "GOVE11", "GPUS11", "GXUS11", "HIGH11", "HTEK11", "IBOB11", "ISUS11", "IVVB11", "IVWO11", "IWMI11", "JOGO11", "LVOL11", "MATB11", "MILL11", "NASD11", "NBOV11", "NDIV11", "NSDV11", "NUCL11", "OURO11", "PEVC11", "PIBB11", "PIPE11", "PKIN11", "QLBR11", "QQQI11", "QQQQ11", "REVE11", "RICO11", "SCVB11", "SILK11", "SLVR11", "SMAB11", "SMAC11", "SMAL11", "SPBZ11", "SPUB11", "SPVT11", "SPXB11", "SPXH11", "SPXI11", "SPXR11", "SPYI11", "SPYR11", "SVAL11", "TECK11", "TECX11", "TIRB11", "TRIG11", "USAL11", "USTK11", "UTEC11", "UTLL11", "VWRA11", "WRLD11", "XBCI11", "XBOV11", "XINA11", "XSPI11",
+}
+
+# Lista de 13 tickers de UNITS conhecidos para detecção automática (sem necessidade de perguntar ao usuário).
+# Lista exportada do site da B3 "https://www.b3.com.br/main.jsp?lumPageId=8A6A8C244DFC31D8014DFC8051B81CFD&lumA=1&lumII=8A80CB81633FBF0B016340E824360853&locale=en_US&doui_processActionId=setLocaleProcessAction&doui_action=setLocaleProcessAction&doui_actionId=setLocaleProcessAction&doui_processActionId=setLocaleProcessAction&doui_processActionId=setLocaleProcessAction" 
+UNITS_TICKERS_CONHECIDOS = {
+    "ALUP11", "BRBI11", "BPAC11", "CPLE11", "ENGI11", "KLBN11", "PPLA11", "SAPR11", "SANB11", "SULA11", "TAEE11", "IGTI11", "RBNS11"
+}
+
+# Fragmentos de CNPJ para detecção de corretoras não-CorrePy
+# Mapeamento: fragmento sem formatação → identificador interno (Adicione novos CNPJs aqui conforme necessário)
+BROKER_CNPJ_MAP = {
+    "18945670": "inter",     # Inter DTVM Ltda. - CNPJ 18.945.670/0001-46
+}
+
+
+###############################################################################
+# Estrutura de dados para operações
+###############################################################################
+
+@dataclass
+class Operation:
+    """Representa uma operação individual extraída da nota de corretagem.
+
+    Atributos principais:
+    - ref_date         : data do pregão.
+    - ticker           : código do ativo (ex.: PETR4, HGLG11).
+    - name             : nome/descrição completa do ativo como aparece na nota.
+    - transaction_type : "buy" ou "sell".
+    - amount           : quantidade negociada.
+    - unit_price       : preço unitário.
+    - total_value      : valor financeiro total (amount x unit_price).
+    - allocated_fee    : taxas rateadas proporcionalmente atribuídas a esta operação.
+    - irrf             : IR retido na fonte indicado na nota.
+    - note_file        : nome do arquivo PDF de origem.
+    - category         : "swing", "day" ou "fii" — preenchido por classify_operations().
+    - asset_type       : tipo do ativo (ON, PN, FII, FIAGRO, BDR, UNITS, ETF) — preenchido por detect_asset_type() ou solicitado ao usuário.
+    - parser_used      : qual camada de parser leu esta operação ("correpy" ou "pdfplumber_<corretora>").
+    """
+
+    ref_date: date
+    ticker: Optional[str]
+    name: str
+    transaction_type: str
+    amount: Decimal
+    unit_price: Decimal
+    total_value: Decimal
+    allocated_fee: Decimal
+    irrf: Decimal
+    note_file: str
+    category: Optional[str] = field(default=None)
+    asset_type: Optional[str] = field(default=None)   
+    parser_used: str = field(default="correpy")
+
+
+###############################################################################
+# Funções auxiliares gerais
+###############################################################################
+
+class PdfPasswordRequiredError(RuntimeError):
+    """Erro específico para PDF protegido por senha ou senha inválida."""
+    pass
+
+
+def resource_path(relative_path: str) -> str:
+    """Retorna o caminho absoluto do recurso (funciona em .py e .exe/PyInstaller)."""
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
+
+def get_data_path(filename: str) -> str:
+    """Caminho para arquivos persistentes (json, config, etc.)."""
+    if getattr(sys, "frozen", False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, filename)
+
+
+def load_json_dict(path: str) -> Dict[str, str]:
+    """Carrega um dicionário JSON do disco; retorna {} em caso de falha."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+        return {}
+    except Exception:
+        return {}
+
+
+def save_json_dict(path: str, data: Dict[str, str]) -> None:
+    """Salva um dicionário como JSON no disco com troca atômica."""
+    dir_path = os.path.dirname(path)
+    if dir_path:
+        os.makedirs(dir_path, exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)
+
+
+def _extract_cpf_from_pdf(pdf_path: str, password: Optional[str] = None) -> Optional[str]:
+    """Extrai o primeiro CPF encontrado no texto do PDF (via PyMuPDF/fitz).
+
+    Retorna somente os 11 dígitos do CPF, ou None se não encontrar.
+    """
+    cpf_regex = r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"
+    try:
+        doc = fitz.open(pdf_path)
+        if password:
+            try:
+                if hasattr(doc, "authenticate"):
+                    doc.authenticate(password)
+            except Exception:
+                return None
+        for page in doc:
+            text = page.get_text("text")
+            match = re.search(cpf_regex, text)
+            if match:
+                cpf = re.sub(r"\D", "", match.group(0))
+                if len(cpf) == 11:
+                    return cpf
+        return None
+    except Exception:
+        return None
+
+
+###############################################################################
+# DETECÇÃO DE TIPO DE ATIVO
+###############################################################################
+
+def detect_asset_type(name: str, ticker: Optional[str]) -> Optional[str]:
+    """Detecta o tipo do ativo a partir da descrição do título e do ticker.
+
+    A detecção é feita por prioridade, do tipo mais específico ao mais genérico:
+
+    Prioridade de detecção:
+    1. ETF           (lista fixa de 112 tickers)
+    2. FII / FIAGRO  (ticker termina em 11 + palavra-chave no nome)
+    3. BDR / DRN     (ticker termina em 33/34, ou "BDR"/"DRN" no nome)
+    4. UNITS         (ticker termina em 11 sem ser FII/FIAGRO, ou "UNIT"/"UNT"/"UN" no nome)
+    5. ON            (palavra "ON" no nome, sem ser UNIT)
+    6. PN            (palavra "PN" no nome)
+
+    Retorna o identificador canônico (ON, PN, FII, FIAGRO, BDR, UNITS, ETF)
+    ou None se não conseguir identificar.
+    """
+    name_upper = (name or "").upper().strip()
+    ticker_upper = (ticker or "").upper().strip()
+
+    # ── 1. ETF CONHECIDO POR TICKER ──────────────────────────────────────────
+    # Verifica a lista de ETFs conhecidos.
+    if ticker_upper in ETF_TICKERS_CONHECIDOS:
+        return ASSET_TYPE_ETF
+
+    # ── 2. FII / FIAGRO ──────────────────────────────────────────────────────
+    # Ticker termina com "11" E nome contém palavra-chave de fundo (dupla condição).
+    if ticker_upper.endswith("11"):
+        fii_keywords = ("FII", "FDO", "FUNDO", "FIAGRO")
+        if any(kw in name_upper for kw in fii_keywords):
+            # Distingue FIAGRO de FII pelo nome
+            if "FIAGRO" in name_upper:
+                return ASSET_TYPE_FIAGRO
+            return ASSET_TYPE_FII
+
+    # ── 3. BDR / DRN ─────────────────────────────────────────────────────────
+    # Tickers terminados em 34 (Nível III) ou 33 (Nível I/II) e/ou contêm "BDR"/"DRN" no nome.
+    if re.search(r"\d{2}(33|34)$", ticker_upper):
+        return ASSET_TYPE_BDR
+    if re.search(r"\bBDR\b|\bDRN\b", name_upper):
+        return ASSET_TYPE_BDR
+
+    # ── 4. UNITS ─────────────────────────────────────────────────────────────
+    # UNITS são identificadas:
+    #   a) Pela lista de UNITS conhecidos por ticker (13 tickers listados)
+    #   b) Pelo texto "UNIT", "UNT" ou " UN " no nome da ação
+    # O espaço em torno de "UN" é importante para não confundir com palavras como "UNI" ou "FUND".
+    if ticker_upper in UNITS_TICKERS_CONHECIDOS:
+        return ASSET_TYPE_UNITS
+    if re.search(r"\bUNIT\b|\bUNT\b|\bUN\b", name_upper):
+        return ASSET_TYPE_UNITS
+
+    # ── 5. ON (Ordinária) ────────────────────────────────────────────────────
+    # A palavra "ON" aparece na descrição do título nas notas.
+    # Exemplos: "VALE ON NM", "KLABIN S/A ON", "RRRP3 ON NM"
+    # \b para evitar falso positivo com palavras que contenham "ON".
+    if re.search(r"\bON\b", name_upper):
+        return ASSET_TYPE_ON
+
+    # ── 6. PN (Preferencial) ─────────────────────────────────────────────────
+    # A palavra "PN" aparece na descrição do título nas notas.
+    # Exemplos: "KLABIN S/A PN N2", "TAESA PN N2"
+    # \b para evitar falso positivo com palavras que contenham "PN".
+    if re.search(r"\bPN\b", name_upper):
+        return ASSET_TYPE_PN
+
+    # Não foi possível identificar automaticamente → retorna None
+    # O chamador deve solicitar ao usuário via modal.
+    return None
+
+
+###############################################################################
+# CAMADA 2: Parser próprio com pdfplumber para layouts não-CorrePy
+###############################################################################
+
+def _detect_broker(text: str) -> str:
+    """Identifica a corretora pelo CNPJ ou nome presente no texto do PDF.
+
+    Retorna uma string identificadora da corretora (ex.: "inter"),
+    ou "unknown" se não reconhecer.
+    """
+    text_digits_only = re.sub(r"\D", "", text)
+    for cnpj_fragment, broker_name in BROKER_CNPJ_MAP.items():
+        if cnpj_fragment in text_digits_only:
+            return broker_name
+    return "unknown"
+
+
+def _extract_text_from_pdf(pdf_path: str, password: Optional[str] = None) -> str:
+    """Extrai texto bruto de todas as páginas do PDF usando PyMuPDF.
+
+    Esse texto é usado por:
+    - detecção de corretora;
+    - parser genérico;
+    - tela de revisão manual assistida.
+
+    Observação:
+    PDFs podem retornar texto fora da ordem visual, por isso o parser genérico
+    deve ser tratado como fallback e validado antes de salvar a apuração.
+    """
+    try:
+        doc = fitz.open(pdf_path)
+        if password:
+            try:
+                doc.authenticate(password)
+            except Exception:
+                pass
+        return "\n".join(page.get_text("text") for page in doc)
+    except Exception as exc:
+        raise RuntimeError(f"Não foi possível extrair texto do PDF: {exc}") from exc
+
+
+def _extract_cpf_from_text(text: str) -> Optional[str]:
+    """Extrai o primeiro CPF encontrado em um texto bruto."""
+    match = re.search(r"\b(\d{3}[\.\s]?\d{3}[\.\s]?\d{3}[\-\s]?\d{2})\b", text or "")
+    if not match:
+        return None
+    cpf = re.sub(r"\D", "", match.group(1))
+    return cpf if len(cpf) == 11 else None
+
+
+def _extract_ref_date_from_text(text: str) -> date:
+    """Tenta localizar a data do pregão no texto bruto da nota.
+
+    Aceita variações comuns:
+    - Data pregão: DD/MM/AAAA
+    - Data do pregão DD/MM/AAAA
+    - cabeçalho com "Folha Data pregão" seguido da data
+    """
+    patterns = [
+        r"Data\s+(?:do\s+)?preg[aã]o[:\s]+(\d{2}/\d{2}/\d{4})",
+        r"Folha\s+Data\s+preg[aã]o\s+.*?(\d{2}/\d{2}/\d{4})",
+        r"\b(\d{2}/\d{2}/\d{4})\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text or "", re.IGNORECASE | re.DOTALL)
+        if match:
+            return _parse_date_br(match.group(1))
+
+    raise RuntimeError("Não foi possível localizar a data do pregão no texto da nota.")
+
+
+def _validate_rows_against_month_cpf(
+    rows: List[dict],
+    filename: str,
+    expected_year: int,
+    expected_month: int,
+    expected_cpf_digits: str,
+    pdf_path: str,
+    password: Optional[str] = None,
+) -> None:
+    """Valida data e CPF das linhas extraídas por parser alternativo/manual."""
+    for r in rows:
+        rd: date = r["ref_date"]
+        if rd.year != expected_year or rd.month != expected_month:
+            raise RuntimeError(
+                f"A nota '{filename}' possui data de pregão {rd:%d/%m/%Y}, "
+                f"que não pertence ao mês {expected_month:02d}/{expected_year}."
+            )
+
+        if expected_cpf_digits:
+            note_cpf = r.get("cpf") or _extract_cpf_from_pdf(pdf_path, password=password)
+            if note_cpf is not None and note_cpf != expected_cpf_digits:
+                raise RuntimeError(
+                    f"A nota '{filename}' possui CPF {formatar_cpf(note_cpf)}, "
+                    f"diferente do CPF informado {formatar_cpf(expected_cpf_digits)}."
+                )
+
+
+def _parse_generic_text_bovespa(pdf_path: str, password: Optional[str] = None) -> List[dict]:
+    """Parser genérico para notas Bovespa à vista quando CorrePy e parser específico falham.
+
+    Estratégia:
+    - extrai texto bruto com PyMuPDF;
+    - procura linhas com C/V;
+    - identifica quantidade, preço unitário, valor total e D/C pelo fim da linha;
+    - tenta localizar ticker por padrão brasileiro (ex.: PETR4, HGLG11);
+    - se não localizar ticker, deixa None para a sua janela `_pedir_ticker` resolver depois.
+
+    Limitação intencional:
+    - Este parser é voltado para operações à vista/fracionário de B3.
+    - Futuros/BMF/WIN/WDO devem ter parser próprio, pois o cálculo tributário é diferente.
+    """
+    filename = os.path.basename(pdf_path)
+    text = _extract_text_from_pdf(pdf_path, password=password)
+
+    ref_date = _extract_ref_date_from_text(text)
+    cpf_digits = _extract_cpf_from_text(text)
+
+    settlement_fee   = _extract_fee_from_label_line(text, r"Taxa\s+de\s+Liquidaçã?o|Taxa\s+de\s+Liquidação\s*/\s*CCP")
+    registration_fee = _extract_fee_from_label_line(text, r"Taxa\s+de\s+Registro")
+    transfer_fee     = _extract_fee_from_label_line(text, r"Taxa\s+de\s+Transfer[eê]ncia\s+de\s+Ativos")
+    emoluments       = _extract_fee_from_label_line(text, r"Emolumentos")
+    irrf_note        = _extract_fee_from_label_line(text, r"I\.?R\.?R\.?F\.?|IRRF")
+
+    money = r"(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2,6}"
+    qty   = r"\d{1,12}(?:\.\d{3})*"
+
+    # Captura o fim da linha:
+    # ... QTD PRECO VALOR D/C
+    end_pattern = re.compile(
+        rf"(?P<before>.+?)\s+(?P<amount>{qty})\s+(?P<unit>{money})\s+(?P<total>{money})\s+(?P<dc>[DC])(?:\s|$)",
+        re.IGNORECASE,
+    )
+
+    rows: List[dict] = []
+
+    for raw_line in text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+
+        line_upper = line.upper()
+
+        # Ignora linhas de resumo/rodapé.
+        if any(x in line_upper for x in ("SUBTOTAL", "RESUMO", "TOTAL", "LIQUIDO", "LÍQUIDO")):
+            continue
+
+        # Só tenta linhas com indicação operacional e mercado Bovespa/B3.
+        if not re.search(r"\b[CV]\b", line_upper):
+            continue
+        if not re.search(r"BOVESPA|B3|VISTA|VIS|FRACION", line_upper):
+            continue
+
+        # Evita tentar interpretar futuros/BMF no parser genérico de ações.
+        if re.search(r"\b(WIN|WDO|IND|DOL)\b|BM&F|BMF|FUTURO", line_upper):
+            continue
+
+        match = end_pattern.search(line_upper)
+        if not match:
+            continue
+
+        before = match.group("before").strip()
+        tokens = before.split()
+
+        cv_idx = None
+        for i, token in enumerate(tokens):
+            if token in ("C", "V"):
+                cv_idx = i
+                break
+
+        if cv_idx is None:
+            continue
+
+        cv = tokens[cv_idx]
+        transaction_type = "buy" if cv == "C" else "sell"
+
+        # Normalmente, após C/V vem o tipo de mercado (VISTA/VIS/FRACIONARIO).
+        name_tokens = tokens[cv_idx + 2:] if len(tokens) > cv_idx + 2 else tokens[cv_idx + 1:]
+        name = " ".join(name_tokens).strip()
+
+        # Tenta localizar ticker brasileiro dentro da descrição.
+        ticker_match = re.search(r"\b[A-Z]{4}\d{1,2}[A-Z]?\b", name)
+        ticker = ticker_match.group(0) if ticker_match else None
+
+        amount = _parse_integer_br(match.group("amount"))
+        unit_price = _parse_decimal_br(match.group("unit"))
+        total_value = _parse_decimal_br(match.group("total"))
+
+        if amount is None or amount <= 0 or unit_price is None or unit_price <= 0:
+            continue
+
+        if total_value is None or total_value <= 0:
+            total_value = amount * unit_price
+
+        if not name:
+            name = ticker or "ATIVO NAO IDENTIFICADO"
+
+        rows.append({
+            "ref_date": ref_date,
+            "ticker": ticker,
+            "name": name,
+            "transaction_type": transaction_type,
+            "amount": amount,
+            "unit_price": unit_price,
+            "total_value": total_value,
+            "settlement_fee_note": settlement_fee,
+            "emoluments_note": emoluments,
+            "registration_fee_note": registration_fee,
+            "transfer_fee_note": transfer_fee,
+            "irrf": irrf_note,
+            "cpf": cpf_digits,
+        })
+
+    if not rows:
+        lines = [
+            re.sub(r"\s+", " ", raw_line).strip()
+            for raw_line in text.splitlines()
+            if raw_line and raw_line.strip()
+        ]
+
+        i = 0
+        while i < len(lines):
+            line_upper = lines[i].upper()
+            if not re.search(r"BOVESPA|B3", line_upper):
+                i += 1
+                continue
+
+            if i + 6 >= len(lines):
+                break
+
+            cv = lines[i + 1].strip().upper()
+            market = lines[i + 2].strip().upper()
+
+            if cv not in ("C", "V"):
+                i += 1
+                continue
+            if not re.search(r"VISTA|VIS|FRACION", market):
+                i += 1
+                continue
+
+            name_parts: List[str] = []
+            j = i + 3
+            while j < len(lines):
+                candidate = lines[j].strip()
+                if re.fullmatch(qty, candidate):
+                    break
+                if re.search(r"RESUMO|TOTAL|LIQUIDO|LÍQUIDO", candidate, re.IGNORECASE):
+                    break
+                name_parts.append(candidate)
+                j += 1
+
+            if (
+                not name_parts
+                or j + 3 >= len(lines)
+                or not re.fullmatch(qty, lines[j].strip())
+                or not re.fullmatch(money, lines[j + 1].strip())
+                or not re.fullmatch(money, lines[j + 2].strip())
+                or lines[j + 3].strip().upper() not in ("C", "D")
+            ):
+                i += 1
+                continue
+
+            name = " ".join(name_parts).strip()
+            ticker_match = re.search(r"\b[A-Z]{4}\d{1,2}[A-Z]?\b", name.upper())
+            ticker = ticker_match.group(0) if ticker_match else None
+
+            amount = _parse_integer_br(lines[j])
+            unit_price = _parse_decimal_br(lines[j + 1])
+            total_value = _parse_decimal_br(lines[j + 2])
+
+            if amount is None or amount <= 0 or unit_price is None or unit_price <= 0:
+                i = j + 4
+                continue
+
+            if total_value is None or total_value <= 0:
+                total_value = amount * unit_price
+
+            rows.append({
+                "ref_date": ref_date,
+                "ticker": ticker,
+                "name": name or ticker or "ATIVO NAO IDENTIFICADO",
+                "transaction_type": "buy" if cv == "C" else "sell",
+                "amount": amount,
+                "unit_price": unit_price,
+                "total_value": total_value,
+                "settlement_fee_note": settlement_fee,
+                "emoluments_note": emoluments,
+                "registration_fee_note": registration_fee,
+                "transfer_fee_note": transfer_fee,
+                "irrf": irrf_note,
+                "cpf": cpf_digits,
+            })
+            i = j + 4
+
+    if not rows:
+        raise RuntimeError(f"Parser genérico: nenhuma operação Bovespa encontrada em '{filename}'.")
+
+    return rows
+
+
+def _parse_manual_review_lines(
+    grid_rows: List[Dict[str, str]],
+    taxas: Dict[str, Decimal],
+    cpf_digits: Optional[str] = None,
+) -> List[dict]:
+    """Converte as linhas da grade visual em linhas de operação.
+
+    Cada elemento de grid_rows é um dict com as chaves:
+        data, c/v, ticker, nome, quantidade, preco, total
+
+    Esses valores vêm dos campos Entry da tabela visual de _revisao_manual_nota().
+    O campo 'total' é opcional: se vazio ou zero, é calculado como quantidade x preço.
+    """
+    rows: List[dict] = []
+
+    for line_no, cell in enumerate(grid_rows, start=1):
+        # Ignora linhas completamente em branco
+        valores = [v.strip() for v in cell.values()]
+        if not any(v for v in valores[:6]):   # os 6 primeiros campos obrigatórios
+            continue
+
+        # ── Data ──────────────────────────────────────────────────────────────
+        data_str = cell.get("data", "").strip()
+        if not data_str:
+            raise RuntimeError(f"Linha {line_no}: campo 'Data' está vazio.")
+        try:
+            ref_date = _parse_date_br(data_str)
+        except Exception:
+            raise RuntimeError(
+                f"Linha {line_no}: data '{data_str}' inválida. Use DD/MM/AAAA."
+            )
+
+        # ── C/V ───────────────────────────────────────────────────────────────
+        cv = cell.get("cv", "").strip().upper()
+        if cv not in ("C", "V"):
+            raise RuntimeError(
+                f"Linha {line_no}: C/V deve ser exatamente 'C' (compra) ou 'V' (venda). "
+                f"Recebido: '{cv}'"
+            )
+
+        # ── Ticker ────────────────────────────────────────────────────────────
+        ticker = cell.get("ticker", "").strip().upper()
+        if not ticker or not re.fullmatch(r"[A-Z0-9]{4,12}", ticker):
+            raise RuntimeError(
+                f"Linha {line_no}: ticker '{ticker}' inválido. "
+                "Use 4 a 12 letras/números, ex.: PETR4, HGLG11."
+            )
+
+        # ── Nome ─────────────────────────────────────────────────────────────
+        name = cell.get("nome", "").strip().upper() or ticker
+
+        # ── Quantidade ───────────────────────────────────────────────────────
+        amount = _parse_integer_br(cell.get("quantidade", ""))
+        if amount is None or amount <= 0:
+            raise RuntimeError(
+                f"Linha {line_no}: quantidade '{cell.get('quantidade')}' inválida. "
+                "Use um número inteiro positivo, ex.: 100"
+            )
+
+        # ── Preço ─────────────────────────────────────────────────────────────
+        unit_price = _parse_decimal_br(cell.get("preco", ""))
+        if unit_price is None or unit_price <= 0:
+            raise RuntimeError(
+                f"Linha {line_no}: preço '{cell.get('preco')}' inválido. "
+                "Use vírgula como decimal, ex.: 28,50"
+            )
+
+        # ── Total (opcional) ──────────────────────────────────────────────────
+        total_str = cell.get("total", "").strip()
+        total_value = _parse_decimal_br(total_str) if total_str else None
+        if total_value is None or total_value <= 0:
+            total_value = amount * unit_price
+
+        rows.append({
+            "ref_date": ref_date,
+            "ticker": ticker,
+            "name": name,
+            "transaction_type": "buy" if cv == "C" else "sell",
+            "amount": amount,
+            "unit_price": unit_price,
+            "total_value": total_value,
+            "settlement_fee_note":  taxas.get("settlement_fee",  Decimal("0")),
+            "emoluments_note":      taxas.get("emoluments",      Decimal("0")),
+            "registration_fee_note": taxas.get("registration_fee", Decimal("0")),
+            "transfer_fee_note":    taxas.get("transfer_fee",    Decimal("0")),
+            "irrf":                 taxas.get("irrf",            Decimal("0")),
+            "cpf": cpf_digits,
+        })
+
+    if not rows:
+        raise RuntimeError(
+            "Nenhuma operação foi preenchida. "
+            "Preencha ao menos uma linha na tabela antes de confirmar."
+        )
+
+    return rows
+
+
+
+def _parse_inter_pdfplumber(pdf_path: str, password: Optional[str] = None) -> List[dict]:
+    """Parser específico para o layout de nota do Banco Inter (Inter DTVM Ltda.).
+
+    Layout da tabela do Inter:
+        Praça | C/V | Tipo Mercado | Especificação do Título | OBS(*) | Quantidade | Preço Liquidação (R$) | Compra/Venda (R$) | D/C
+
+    Extrai também:
+    - Data do pregão do cabeçalho
+    - CPF do cliente
+    - Taxas do Resumo Financeiro (liquidação, emolumentos, registro, transferência de ativos)
+
+    Retorna lista de dicts com:
+        ref_date, ticker, name, transaction_type, amount, unit_price,
+        total_value, settlement_fee_note, emoluments_note,
+        registration_fee_note, transfer_fee_note, irrf, cpf
+    """
+    open_kwargs = {"password": password} if password else {}
+
+    with pdfplumber.open(pdf_path, **open_kwargs) as pdf:
+        full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    # Extrai data do pregão: "Data pregão: DD/MM/AAAA"
+    date_match = re.search(r"Data\s+preg[aã]o[:\s]+(\d{2}/\d{2}/\d{4})", full_text, re.IGNORECASE)
+    if not date_match:
+        raise RuntimeError("Parser Inter: não foi possível localizar a data do pregão.")
+    ref_date = _parse_date_br(date_match.group(1))
+
+    # Extrai CPF do cliente
+    cpf_match = re.search(r"\b(\d{3}[\.\s]?\d{3}[\.\s]?\d{3}[\-\s]?\d{2})\b", full_text)
+    cpf_digits = re.sub(r"\D", "", cpf_match.group(1)) if cpf_match else None
+
+    # Extrai taxas do Resumo Financeiro
+    settlement_fee   = _extract_fee_from_label_line(full_text, r"Taxa\s+de\s+Liquidaçã?o")
+    registration_fee = _extract_fee_from_label_line(full_text, r"Taxa\s+de\s+Registro\s*\(\d+\)\s*([\d.,]+)")
+    transfer_fee     = _extract_fee_from_label_line(full_text, r"Taxa\s+de\s+Transfer[eê]ncia\s+de\s+Ativos\s+([\d.,]+)")
+    emoluments       = _extract_fee_from_label_line(full_text, r"Emolumentos\s+([\d.,]+)")
+    irrf_note        = _extract_fee_from_label_line(full_text, r"I\.R\.R\.F?\s+([\d.,]+)")
+
+    # Extrai operações da tabela
+    operations: List[dict] = []
+
+    with pdfplumber.open(pdf_path, **open_kwargs) as pdf:
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            for table in tables:
+                if not table:
+                    continue
+                for row in table:
+                    row_clean = [str(c).strip() if c is not None else "" for c in row]
+                    if len(row_clean) < 7:
+                        continue
+
+                    # Coluna C/V identifica linha de operação
+                    cv_col = row_clean[1].upper().strip()
+                    if cv_col not in ("C", "V"):
+                        continue
+
+                    # "Especificação do Título": "RRRP3 ON NM"
+                    especificacao = row_clean[3].strip()
+                    if not especificacao:
+                        continue
+
+                    partes_spec = especificacao.split()
+                    ticker = partes_spec[0].upper() if partes_spec else None
+                    name   = especificacao  # nome completo para detect_asset_type
+
+                    amount     = _parse_integer_br(row_clean[5])
+                    unit_price = _parse_decimal_br(row_clean[6])
+                    if amount is None or amount <= 0:
+                        continue
+                    if unit_price is None or unit_price <= 0:
+                        continue
+
+                    operations.append({
+                        "ref_date": ref_date,
+                        "ticker": ticker,
+                        "name": name,
+                        "transaction_type": "buy" if cv_col == "C" else "sell",
+                        "amount": amount,
+                        "unit_price": unit_price,
+                        "total_value": amount * unit_price,
+                        "settlement_fee_note": settlement_fee,
+                        "emoluments_note": emoluments,
+                        "registration_fee_note": registration_fee,
+                        "transfer_fee_note": transfer_fee,
+                        "irrf": irrf_note,
+                        "cpf": cpf_digits,
+                    })
+
+    if not operations:
+        raise RuntimeError("Parser Inter (pdfplumber): nenhuma operação encontrada na tabela da nota.")
+
+    return operations
+
+
+def _extract_fee_from_label_line(text: str, label_pattern: str) -> Decimal:
+    """Extrai o último valor monetário da linha que contém o rótulo da taxa."""
+    money_pattern = r"\d{1,3}(?:\.\d{3})*,\d+|\d+,\d+"
+    for line in text.splitlines():
+        if not re.search(label_pattern, line, re.IGNORECASE):
+            continue
+        values = re.findall(money_pattern, line)
+        if not values:
+            return Decimal("0")
+        val = _parse_decimal_br(values[-1])
+        return val if val is not None else Decimal("0")
+    return Decimal("0")
+
+
+def _parse_decimal_br(value: str) -> Optional[Decimal]:
+    """Converte string BR (1.000,50) ou EN (1000.50) para Decimal.
+
+    Retorna None se a conversão falhar.
+    """
+    if not value:
+        return None
+    v = str(value).strip()
+    v = re.sub(r"[^\d,\.\-]", "", v)
+    if not v:
+        return None
+    if "," in v and "." in v:
+        if v.rfind(",") > v.rfind("."):
+            v = v.replace(".", "").replace(",", ".")
+        else:
+            v = v.replace(",", "")
+    elif "," in v:
+        v = v.replace(".", "").replace(",", ".")
+    try:
+        return Decimal(v)
+    except InvalidOperation:
+        return None
+
+
+def _parse_integer_br(value: str) -> Optional[Decimal]:
+    """Converte inteiro em formato BR com separador de milhar (ex.: 1.000)."""
+    if not value:
+        return None
+    v = re.sub(r"\D", "", str(value))
+    if not v:
+        return None
+    return Decimal(v)
+
+
+def _recover_amount_from_extracted_text(
+    text: str,
+    ticker: Optional[str],
+    unit_price: Decimal,
+) -> Optional[Decimal]:
+    """Recupera quantidade quando o CorrePy retorna 0 para uma operação.
+
+    Algumas notas extraem a tabela em linhas verticais:
+        TGAR11
+        1650
+        84,70
+        139.755,00
+        C
+
+    Nesses casos, procuramos o ticker e, nas linhas seguintes, uma quantidade
+    inteira seguida pelo mesmo preço unitário informado pelo CorrePy.
+    """
+    ticker_upper = (ticker or "").upper().strip()
+    if not ticker_upper:
+        return None
+
+    lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in text.splitlines()
+        if line and line.strip()
+    ]
+
+    for idx, line in enumerate(lines):
+        if not re.search(rf"\b{re.escape(ticker_upper)}\b", line.upper()):
+            continue
+
+        window = lines[idx + 1:idx + 10]
+        for pos in range(len(window) - 1):
+            amount = _parse_integer_br(window[pos])
+            price = _parse_decimal_br(window[pos + 1])
+            if amount is None or amount <= 0 or price is None:
+                continue
+            if price == unit_price:
+                return amount
+
+    return None
+
+
+def _parse_date_br(date_str: str) -> date:
+    """Converte 'DD/MM/AAAA' em objeto date."""
+    day, month, year = date_str.strip().split("/")
+    return date(int(year), int(month), int(day))
+
+
+def _build_operations_from_pdfplumber_rows(
+    rows: List[dict],
+    filename: str,
+    broker: str,
+) -> List[Operation]:
+    """Converte as linhas brutas do parser pdfplumber em objetos Operation.
+
+    O rateio de taxas é proporcional ao valor financeiro de cada operação,
+    idêntico ao que é feito para notas SINACOR (CorrePy).
+    O campo asset_type é deixado None; será preenchido depois por resolve_asset_types().
+    """
+    if not rows:
+        return []
+
+    total_value_note = sum(r["total_value"] for r in rows)
+    if total_value_note == 0:
+        raise RuntimeError(
+            f"Parser pdfplumber ({broker}): valor total zerado no arquivo '{filename}'."
+        )
+
+    total_fees = (
+        rows[0].get("settlement_fee_note", Decimal("0"))
+        + rows[0].get("emoluments_note", Decimal("0"))
+        + rows[0].get("registration_fee_note", Decimal("0"))
+        + rows[0].get("transfer_fee_note", Decimal("0"))
+    )
+
+    operations: List[Operation] = []
+    for r in rows:
+        proportion = r["total_value"] / total_value_note if total_value_note else Decimal("0")
+        operations.append(Operation(
+            ref_date=r["ref_date"],
+            ticker=r["ticker"],
+            name=r["name"],
+            transaction_type=r["transaction_type"],
+            amount=r["amount"],
+            unit_price=r["unit_price"],
+            total_value=r["total_value"],
+            allocated_fee=total_fees * proportion,
+            irrf=r.get("irrf", Decimal("0")),
+            note_file=filename,
+            asset_type=None,  
+            parser_used=f"pdfplumber_{broker}",
+        ))
+
+    return operations
+
+
+###############################################################################
+# Leitura de nota com CASCATA DE PARSERS (Camada 1 → Camada 2)
+###############################################################################
+
+def read_brokerage_notes(
+    pdf_path: str,
+    expected_year: int,
+    expected_month: int,
+    expected_cpf_digits: str,
+    password: Optional[str] = None,
+    manual_review_cb: Optional[Callable[[str, str, List[str]], Optional[List[dict]]]] = None,
+) -> Tuple[List, str]:
+    """Lê e valida uma nota usando a cascata de parsers.
+
+    Ordem aplicada:
+        1) CorrePy padrão;
+        2) parser específico da corretora detectada;
+        3) parser genérico;
+        4) tela de revisão manual assistida.
+
+    Retorna:
+        (notes_or_ops, source)
+        - notes_or_ops: lista de BrokerageNote (CorrePy) OU list[Operation] dos parsers alternativos;
+        - source: "correpy", "pdfplumber_<corretora>", "generic_text" ou "manual_review".
+    """
+
+    filename = os.path.basename(pdf_path)
+    errors: List[str] = []
+
+    # ── 1) CAMADA CORREPY ─────────────────────────────────────────────────────
+    try:
+        with open(pdf_path, "rb") as f:
+            content = io.BytesIO(f.read())
+            content.seek(0)
+
+        parser = ParserFactory(brokerage_note=content, password=password).parse()
+        notes = list(parser)
+
+        if not notes:
+            errors.append("CorrePy: retornou lista vazia.")
+        else:
+            # Daqui em diante CorrePy já conseguiu montar notas.
+            # Se CPF/data divergirem, é erro real de validação e não deve cair em fallback.
+            correpy_validating = True
+            for note in notes:
+                if not hasattr(note, "reference_date") or note.reference_date is None:
+                    raise RuntimeError(
+                        f"Não foi possível obter a data do pregão na nota '{filename}'."
+                    )
+
+                ref_date = note.reference_date
+                if ref_date.year != expected_year or ref_date.month != expected_month:
+                    raise RuntimeError(
+                        f"A nota '{filename}' possui data de pregão {ref_date:%d/%m/%Y}, "
+                        f"que não pertence ao mês {expected_month:02d}/{expected_year}."
+                    )
+
+                if expected_cpf_digits:
+                    note_cpf = _extract_cpf_from_pdf(pdf_path, password=password)
+                    if note_cpf is None:
+                        raise RuntimeError(
+                            f"Não foi possível identificar o CPF do cliente na nota '{filename}'."
+                        )
+                    if note_cpf != expected_cpf_digits:
+                        raise RuntimeError(
+                            f"A nota '{filename}' possui CPF {formatar_cpf(note_cpf)}, "
+                            f"diferente do CPF informado {formatar_cpf(expected_cpf_digits)}."
+                        )
+
+            return notes, "correpy"
+
+    except InvalidPasswordException as e:
+        raise PdfPasswordRequiredError(
+            f"PDF protegido por senha ou senha inválida: {filename}"
+        ) from e
+    except PdfPasswordRequiredError:
+        raise
+    except RuntimeError as e:
+        if correpy_validating:
+            # RuntimeError aqui vem de validação de CPF/data após CorrePy montar a nota.
+            # Nesse caso NÃO é seguro cair em parser alternativo.
+            raise
+        errors.append(f"CorrePy: {e}")
+    except Exception as e:
+        errors.append(f"CorrePy: {e}")
+
+    # A partir daqui, precisa do texto bruto para detectar corretora, usar parser genérico
+    # e preencher a tela manual se necessário.
+    try:
+        full_text = _extract_text_from_pdf(pdf_path, password=password)
+    except Exception as e:
+        full_text = ""
+        errors.append(f"Extração de texto: {e}")
+
+    broker = _detect_broker(full_text)
+
+    # ── 2) PARSER ESPECÍFICO DA CORRETORA ─────────────────────────────────────
+    if not _PDFPLUMBER_AVAILABLE:
+        errors.append("pdfplumber: não instalado. Use 'pip install pdfplumber'.")
+    else:
+        parser_map = {
+            "inter": _parse_inter_pdfplumber,
+            # Futuras corretoras:
+            # "genial": _parse_genial_pdfplumber,
+            # "toro": _parse_toro_pdfplumber,
+            # "xp": _parse_xp_pdfplumber,
+        }
+
+        specific_parser = parser_map.get(broker)
+
+        if specific_parser is None:
+            errors.append(f"Parser específico: corretora '{broker}' sem parser cadastrado.")
+        else:
+            try:
+                rows = specific_parser(pdf_path, password=password)
+
+                _validate_rows_against_month_cpf(
+                    rows=rows,
+                    filename=filename,
+                    expected_year=expected_year,
+                    expected_month=expected_month,
+                    expected_cpf_digits=expected_cpf_digits,
+                    pdf_path=pdf_path,
+                    password=password,
+                )
+
+                operations = _build_operations_from_pdfplumber_rows(rows, filename, broker)
+                return operations, f"pdfplumber_{broker}"
+
+            except Exception as e:
+                errors.append(f"Parser específico ({broker}): {e}")
+
+    # ── 3) PARSER GENÉRICO ────────────────────────────────────────────────────
+    try:
+        rows = _parse_generic_text_bovespa(pdf_path, password=password)
+
+        _validate_rows_against_month_cpf(
+            rows=rows,
+            filename=filename,
+            expected_year=expected_year,
+            expected_month=expected_month,
+            expected_cpf_digits=expected_cpf_digits,
+            pdf_path=pdf_path,
+            password=password,
+        )
+
+        operations = _build_operations_from_pdfplumber_rows(rows, filename, "generic")
+        for op in operations:
+            op.parser_used = "generic_text"
+        return operations, "generic_text"
+
+    except Exception as e:
+        errors.append(f"Parser genérico: {e}")
+
+    # ── 4) TELA DE REVISÃO MANUAL ASSISTIDA ───────────────────────────────────
+    if manual_review_cb is not None:
+        rows = manual_review_cb(filename, full_text, errors)
+        if rows:
+            _validate_rows_against_month_cpf(
+                rows=rows,
+                filename=filename,
+                expected_year=expected_year,
+                expected_month=expected_month,
+                expected_cpf_digits=expected_cpf_digits,
+                pdf_path=pdf_path,
+                password=password,
+            )
+
+            operations = _build_operations_from_pdfplumber_rows(rows, filename, "manual")
+            for op in operations:
+                op.parser_used = "manual_review"
+            return operations, "manual_review"
+
+        errors.append("Revisão manual: cancelada ou nenhuma operação informada.")
+
+    raise RuntimeError(
+        f"Não foi possível ler a nota '{filename}' por nenhuma camada.\n\n"
+        + "\n".join(f"- {err}" for err in errors)
+    )
+
+
+
+###############################################################################
+# Lógica de negócio: classificação, cálculo e carteira
+###############################################################################
+
+def is_fii(name: str, ticker: Optional[str]) -> bool:
+    """Retorna True se o ativo for FII ou FIAGRO (ambas as condições devem ser atendidas).
+
+    Regras:
+    - Ticker termina com '11', E
+    - Nome contém 'FII', 'FDO', 'FUNDO' ou 'FIAGRO'.
+
+    Isso naturalmente exclui ETFs como BOVA11 (sem 'FII' no nome)
+    e UNITS como SAPR11 (sem 'FII' no nome).
+    """
+    if not ticker:
+        return False
+    if ticker.endswith("11"):
+        name_upper = name.upper()
+        if any(keyword in name_upper for keyword in ("FII", "FDO", "FUNDO", "FIAGRO")):
+            return True
+    return False
+
+
+def parse_month_folder(
+    month_folder: str,
+    expected_year: int,
+    expected_month: int,
+    expected_cpf_digits: str,
+    password_map: Optional[Dict[str, Optional[str]]] = None,
+    ask_password_cb: Optional[Callable[[str], Optional[str]]] = None,
+    ask_quantity_cb: Optional[Callable[[str, date, str, str, Decimal], Optional[Decimal]]] = None,
+    ask_manual_review_cb: Optional[Callable[[str, str, List[str]], Optional[List[dict]]]] = None,
+) -> List[Operation]:
+    """Varre a pasta do mês e extrai todas as operações.
+
+    - Arquivos processados em ORDEM ALFABÉTICA para consistência entre execuções.
+    - Senha solicitada individualmente por arquivo, com retry.
+    - O campo asset_type de cada Operation fica None aqui;
+      será preenchido depois por resolve_asset_types() na interface.
+    """
+
+    if password_map is None:
+        password_map = {}
+
+    operations: List[Operation] = []
+
+    # sorted() garante ordem determinística independente do OS
+    pdf_files = sorted(
+        [f for f in os.listdir(month_folder) if f.lower().endswith(".pdf")]
+    )
+
+    for filename in pdf_files:
+        pdf_path = os.path.join(month_folder, filename)
+        senha_arquivo = password_map.get(filename)
+
+        while True:
+            try:
+                result, source = read_brokerage_notes(
+                    pdf_path,
+                    expected_year=expected_year,
+                    expected_month=expected_month,
+                    expected_cpf_digits=expected_cpf_digits,
+                    password=senha_arquivo,
+                    manual_review_cb=ask_manual_review_cb,
+                )
+                password_map[filename] = senha_arquivo
+                break
+            except PdfPasswordRequiredError:
+                if ask_password_cb is None:
+                    raise RuntimeError(
+                        f"O arquivo '{filename}' requer senha, mas não há mecanismo para solicitá-la."
+                    )
+                nova_senha = ask_password_cb(filename)
+                if nova_senha is None:
+                    raise RuntimeError(
+                        f"Apuração cancelada: senha não informada para o arquivo '{filename}'."
+                    )
+                senha_arquivo = nova_senha
+
+        if source == "correpy":
+            notes = result
+            raw_text_for_quantity: Optional[str] = None
+            for note in notes:
+                corrected_amounts: List[Decimal] = []
+                corrected_tx_values: List[Decimal] = []
+                total_value_note = Decimal(0)
+
+                for tx in note.transactions:
+                    amount = tx.amount
+                    if amount is None or amount <= 0:
+                        if raw_text_for_quantity is None:
+                            raw_text_for_quantity = _extract_text_from_pdf(pdf_path, password=senha_arquivo)
+
+                        recovered_amount = _recover_amount_from_extracted_text(
+                            text=raw_text_for_quantity,
+                            ticker=tx.security.ticker,
+                            unit_price=tx.unit_price,
+                        )
+                        if recovered_amount is not None:
+                            amount = recovered_amount
+                        else:
+                            if ask_quantity_cb is None:
+                                raise RuntimeError(
+                                    "Quantidade zerada encontrada, mas não há callback para solicitar ao usuário."
+                                )
+                            amount_user = ask_quantity_cb(
+                                filename,
+                                note.reference_date,
+                                tx.security.ticker,
+                                tx.transaction_type.value,
+                                tx.unit_price,
+                            )
+                            if amount_user is None:
+                                raise RuntimeError(
+                                    f"Operação cancelada: quantidade não informada para "
+                                    f"{tx.security.ticker} em {note.reference_date:%d/%m/%Y}."
+                                )
+                            amount = amount_user
+
+                    if amount is None or amount <= 0:
+                        raise RuntimeError(
+                            f"Quantidade inválida para {tx.security.ticker} "
+                            f"em {note.reference_date:%d/%m/%Y} no arquivo '{filename}'."
+                        )
+
+                    corrected_amounts.append(amount)
+                    tx_value = tx.unit_price * amount
+                    corrected_tx_values.append(tx_value)
+                    total_value_note += tx_value
+
+                if total_value_note == 0:
+                    raise RuntimeError(
+                        f"O arquivo '{filename}' gerou valor total inválido (0)."
+                    )
+
+                total_fees = (
+                    note.settlement_fee + note.registration_fee + note.term_fee
+                    + note.ana_fee + note.emoluments + note.operational_fee
+                    + note.execution + note.custody_fee + note.taxes + note.others
+                )
+
+                for idx, tx in enumerate(note.transactions):
+                    amount = corrected_amounts[idx]
+                    tx_value = corrected_tx_values[idx]
+                    proportion = (tx_value / total_value_note) if total_value_note else Decimal("0")
+
+                    op = Operation(
+                        ref_date=note.reference_date,
+                        ticker=tx.security.ticker,
+                        name=tx.security.name,
+                        transaction_type=tx.transaction_type.value,
+                        amount=amount,
+                        unit_price=tx.unit_price,
+                        total_value=tx_value,
+                        allocated_fee=total_fees * proportion,
+                        irrf=tx.source_withheld_taxes,
+                        note_file=filename,
+                        asset_type=None,  # preenchido depois
+                        parser_used="correpy",
+                    )
+                    operations.append(op)
+        else:
+            operations.extend(result)
+
+    if not operations:
+        raise RuntimeError(
+            "Nenhuma operação foi encontrada na pasta informada. "
+            "Verifique se os PDFs estão no padrão SINACOR (ou Inter) e se pertencem ao mês selecionado."
+        )
+
+    return operations
+
+
+def classify_operations(ops: List[Operation]) -> None:
+    """Classifica cada operação como 'day', 'fii' ou 'swing'.
+
+    Agrupa por (note_file, ref_date, ticker). Compra e venda da MESMA ação
+    em notas DIFERENTES NÃO é detectado como day trade (comportamento intencional).
+
+    Quando há day trade parcial, divide a operação em duas:
+    parte "day" e parte "swing"/"fii".
+    """
+    new_ops: List[Operation] = []
+
+    group_map: Dict[Tuple[str, date, str], List[Operation]] = {}
+    for op in ops:
+        key = (op.note_file, op.ref_date, op.ticker)
+        group_map.setdefault(key, []).append(op)
+
+    for _, group_ops in group_map.items():
+        buys  = [o for o in group_ops if o.transaction_type == "buy"]
+        sells = [o for o in group_ops if o.transaction_type == "sell"]
+
+        qty_day = min(sum(o.amount for o in buys), sum(o.amount for o in sells))
+
+        if qty_day > 0:
+            for ops_side in (buys, sells):
+                remaining = qty_day
+                for o in ops_side:
+                    if remaining <= 0:
+                        break
+                    q = min(o.amount, remaining)
+                    if q <= 0:
+                        continue
+                    ratio = q / o.amount if o.amount else Decimal(0)
+                    day_op = deepcopy(o)
+                    day_op.amount       = q
+                    day_op.total_value  = q * o.unit_price
+                    day_op.allocated_fee = o.allocated_fee * ratio
+                    day_op.irrf         = (o.irrf or Decimal(0)) * ratio
+                    day_op.category     = "day"
+                    new_ops.append(day_op)
+                    o.amount       -= q
+                    o.total_value   = o.amount * o.unit_price
+                    o.allocated_fee -= day_op.allocated_fee
+                    o.irrf          = (o.irrf or Decimal(0)) - day_op.irrf
+                    remaining -= q
+
+        for o in group_ops:
+            if o.amount <= 0:
+                continue
+            o.category = (
+                "fii"
+                if o.asset_type in (ASSET_TYPE_FII, ASSET_TYPE_FIAGRO) or is_fii(o.name, o.ticker)
+                else "swing"
+            )
+            new_ops.append(o)
+
+    ops.clear()
+    ops.extend(new_ops)
+
+
+def process_results(
+    ops: List[Operation],
+    positions: Dict[str, List[Tuple[Decimal, Decimal]]],
+    irrf_day_from_notes: Decimal = Decimal(0),
+) -> Tuple[
+    Decimal, Decimal, Decimal, Decimal,  # result_swing_isento, result_swing_tributavel, result_day, result_fii
+    Decimal, Decimal, Decimal,           # irrf_swing, irrf_day, irrf_fii
+    Decimal, Decimal,                    # vendas_on_pn, vendas_outros (para G20 e regra dos 20k)
+    Dict[str, List[Tuple[Decimal, Decimal]]],
+    bool,
+]:
+    """Calcula os resultados líquidos separados por tipo de ativo.
+
+    O custo das posições é controlado por Custo Médio Ponderado:
+    - compra: soma o custo da compra ao custo total em carteira e recalcula o preço médio;
+    - venda: baixa a quantidade vendida pelo preço médio vigente do ticker.
+
+    NOVO: O resultado de swing trade é separado em dois acumuladores:
+    - result_swing_on_pn   : lucro/prejuízo de ON e PN (elegíveis à isenção de 20k)
+    - result_swing_outros  : lucro/prejuízo de BDR, UNITS, ETF (sem isenção, sempre B15)
+
+    Também acumula separadamente:
+    - vendas_on_pn  : total de vendas de ON+PN no mês (para regra dos 20k)
+    - vendas_outros : total de vendas dos demais tipos swing (para somar em G20)
+
+    A decisão B15 vs J20 para ON+PN é feita em update_month_sheet(),
+    que recebe vendas_on_pn e compara com LIMITE_ISENCAO_ON_PN. O G20 recebe
+    vendas_on_pn + vendas_outros, mas esse total não altera a regra dos 20k.
+    """
+    ops_sorted = sorted(ops, key=lambda o: (o.ref_date, o.note_file))
+
+    # Garante uma única posição consolidada por ticker, mesmo que a origem tenha lotes.
+    for ticker, lots in list(positions.items()):
+        total_qty = sum(q for q, _ in lots)
+        if total_qty == 0:
+            positions[ticker] = []
+            continue
+        total_cost = sum(q * c for q, c in lots)
+        avg_cost = total_cost / total_qty if total_qty > 0 else Decimal("0")
+        positions[ticker] = [(total_qty, avg_cost)]
+
+    # Resultados swing separados por elegibilidade à isenção
+    result_swing_on_pn  = Decimal(0)  # ON e PN
+    result_swing_outros = Decimal(0)  # BDR, UNITS, ETF e tipos desconhecidos
+
+    result_day = Decimal(0)
+    result_fii = Decimal(0)
+
+    irrf_swing = Decimal(0)
+    irrf_day   = Decimal(0)
+    irrf_fii   = Decimal(0)
+
+    # Acumuladores de volume de vendas para cálculo de isenção e G20
+    vendas_on_pn  = Decimal(0)  # vendas de ON+PN; usado para a regra dos 20k
+    vendas_outros = Decimal(0)  # vendas de BDR/UNITS/ETF e outros swing sem isenção
+
+    day_groups: Dict[Tuple[date, str, str], List[Operation]] = {}
+
+    for op in ops_sorted:
+        if op.category not in ("day", "swing", "fii"):
+            raise RuntimeError(
+                f"Operação com categoria inválida '{op.category}' na nota '{op.note_file}'."
+            )
+
+        if op.category == "day":
+            key = (op.ref_date, op.ticker.strip().upper(), op.note_file)
+            day_groups.setdefault(key, []).append(op)
+            continue
+
+        ticker = op.ticker.strip().upper()
+
+        if op.transaction_type == "buy":
+            purchase_cost = (op.unit_price * op.amount) + op.allocated_fee
+            current_qty, current_avg = (
+                positions.get(ticker, [(Decimal(0), Decimal(0))])[0]
+                if positions.get(ticker)
+                else (Decimal(0), Decimal(0))
+            )
+            new_qty = current_qty + op.amount
+
+            if new_qty > 0:
+                if current_qty > 0:
+                    current_cost = current_qty * current_avg
+                    new_avg = (current_cost + purchase_cost) / new_qty
+                else:
+                    # Se havia posição negativa, o custo médio passa a refletir
+                    # apenas a sobra positiva coberta por esta compra.
+                    new_avg = purchase_cost / op.amount
+                positions[ticker] = [(new_qty, new_avg)]
+            elif new_qty < 0:
+                positions[ticker] = [(new_qty, Decimal("0"))]
+            else:
+                positions[ticker] = []
+
+        elif op.transaction_type == "sell":
+            sale_value  = op.unit_price * op.amount
+            current_qty, current_avg = (
+                positions.get(ticker, [(Decimal(0), Decimal(0))])[0]
+                if positions.get(ticker)
+                else (Decimal(0), Decimal(0))
+            )
+
+            qty_available = current_qty if current_qty > 0 else Decimal(0)
+            qty_costed = min(op.amount, qty_available)
+            cost_total = qty_costed * current_avg
+            new_qty = current_qty - op.amount
+
+            if new_qty > 0:
+                positions[ticker] = [(new_qty, current_avg)]
+            elif new_qty < 0:
+                positions[ticker] = [(new_qty, Decimal("0"))]
+            else:
+                positions[ticker] = []
+
+            profit = sale_value - cost_total - op.allocated_fee
+
+            if op.category == "fii":
+                result_fii += profit
+                irrf_fii   += op.irrf
+
+            elif op.category == "swing":
+                # Separa o resultado pelo tipo do ativo para a regra de isenção
+                tipo = op.asset_type or ""
+
+                if tipo in ASSET_TYPES_COM_ISENCAO:
+                    # ON ou PN: acumula no resultado elegível à isenção
+                    result_swing_on_pn += profit
+                    vendas_on_pn       += sale_value  # volume de venda para cálculo de 20k
+                else:
+                    # BDR, UNITS, ETF, ou tipo desconhecido: sempre tributável
+                    result_swing_outros += profit
+                    vendas_outros       += sale_value
+
+                irrf_swing += op.irrf
+
+    # Processa Day Trade
+    for _, ops_day in day_groups.items():
+        buy_total = sell_total = buy_fee = sell_fee = irrf_day_group = Decimal(0)
+
+        for op in ops_day:
+            irrf_day_group += (op.irrf or Decimal(0))
+            if op.transaction_type == "buy":
+                buy_total += op.total_value
+                buy_fee   += op.allocated_fee
+            elif op.transaction_type == "sell":
+                sell_total += op.total_value
+                sell_fee   += op.allocated_fee
+
+        profit = (sell_total - sell_fee) - (buy_total + buy_fee)
+        result_day += profit
+
+        if irrf_day_group > 0:
+            irrf_day += irrf_day_group
+        elif profit > 0:
+            irrf_day += profit * Decimal("0.01")
+
+    irrf_day += irrf_day_from_notes
+
+    has_negative_positions = any(
+        sum(q for q, _ in lots) < 0
+        for lots in positions.values()
+    )
+
+    return (
+        result_swing_on_pn, result_swing_outros,
+        result_day, result_fii,
+        irrf_swing, irrf_day, irrf_fii,
+        vendas_on_pn, vendas_outros,
+        positions, has_negative_positions,
+    )
+
+
+###############################################################################
+# Utilitários de formatação e validação
+###############################################################################
+
+def fmt(value: Decimal) -> str:
+    """Formata Decimal com duas casas, usando vírgula como separador decimal."""
+    return f"{value:.2f}".replace(".", ",")
+
+
+def is_file_locked_for_write(path: str) -> bool:
+    """Retorna True quando o arquivo não pode ser aberto para escrita."""
+    try:
+        with open(path, "r+b"):
+            return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        raise RuntimeError(
+            f"Não foi possível acessar o arquivo Excel selecionado: {exc}"
+        ) from exc
+
+
+def validar_cpf(cpf: str) -> bool:
+    """Valida CPF (dígitos verificadores)."""
+    cpf = re.sub(r"[^\d]", "", cpf)
+    if len(cpf) != 11 or cpf == cpf[0] * 11:
+        return False
+    soma1 = sum(int(cpf[i]) * (10 - i) for i in range(9))
+    dig1  = (soma1 * 10 % 11) % 10
+    if dig1 != int(cpf[9]):
+        return False
+    soma2 = sum(int(cpf[i]) * (11 - i) for i in range(10))
+    dig2  = (soma2 * 10 % 11) % 10
+    return dig2 == int(cpf[10])
+
+
+def formatar_cpf(cpf: str) -> str:
+    """Formata CPF no padrão XXX.XXX.XXX-XX."""
+    cpf = re.sub(r"[^\d]", "", cpf)
+    return f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
+
+
+###############################################################################
+# Exportação de Debug para Excel (SOMENTE sob demanda do usuário)
+###############################################################################
+
+def export_debug_excel(operations: List[Operation], output_path: str) -> None:
+    """Gera um Excel com todas as operações lidas para conferência.
+
+    Gerado APENAS quando o usuário clicar em 'Exportar Debug'.
+    Inclui a coluna 'Tipo do Ativo' para facilitar a verificação da detecção automática.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Memória de Cálculo de Operações"
+
+    headers = [
+        "#", "Data", "Ticker", "Nome", "Tipo Ativo",
+        "Operação", "Quantidade", "Preço Unitário", "Valor Total",
+        "Taxa Rateada", "IRRF", "Categoria", "Arquivo PDF", "Parser Utilizado",
+    ]
+
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font  = header_font
+        cell.fill  = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for i, op in enumerate(operations, start=1):
+        ws.append([
+            i,
+            op.ref_date.strftime("%d/%m/%Y"),
+            op.ticker or "",
+            op.name,
+            op.asset_type or "?",           
+            op.transaction_type,
+            float(op.amount),
+            float(op.unit_price),
+            float(op.total_value),
+            float(op.allocated_fee),
+            float(op.irrf) if op.irrf else 0.0,
+            op.category or "",
+            op.note_file,
+            op.parser_used,
+        ])
+
+    for col in ws.columns:
+        max_len = max((len(str(cell.value)) for cell in col if cell.value), default=10)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 50)
+
+    wb.save(output_path)
+
+
+###############################################################################
+# Funções de planilha Excel (resultado da apuração)
+###############################################################################
+
+def resolve_month_sheet_name(workbook, expected_month: int, expected_year: int) -> str:
+    """Encontra a aba mensal aceitando MM.AA, MM.AAAA, MM/AA ou MM/AAAA."""
+    matches: List[str] = []
+    pattern = re.compile(r"^\s*(\d{1,2})\s*[./]\s*(\d{2}|\d{4})\s*$")
+
+    for sheet_name in workbook.sheetnames:
+        match = pattern.fullmatch(str(sheet_name))
+        if not match:
+            continue
+        month     = int(match.group(1))
+        year_text = match.group(2)
+        if month != expected_month:
+            continue
+        if len(year_text) == 2:
+            if int(year_text) == expected_year % 100:
+                matches.append(sheet_name)
+        elif int(year_text) == expected_year:
+            matches.append(sheet_name)
+
+    if not matches:
+        raise RuntimeError(
+            f"Nenhuma aba do mês {expected_month:02d}/{expected_year} foi encontrada na planilha. "
+            "Use um destes padrões: MM.AA, MM.AAAA, MM/AA ou MM/AAAA."
+        )
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Foram encontradas várias abas para {expected_month:02d}/{expected_year}: "
+            f"{', '.join(matches)}. Deixe apenas uma aba mensal correspondente."
+        )
+    return matches[0]
+
+
+def update_month_sheet(
+    workbook,
+    sheet_name: str,
+    name: str,
+    cpf: str,
+    result_swing_on_pn: Decimal,    # resultado de ON+PN (pode ir para J20 ou B15)
+    result_swing_outros: Decimal,   # resultado de BDR/UNITS/ETF (sempre B15)
+    result_day: Decimal,
+    result_fii: Decimal,
+    irrf_swing: Decimal,
+    irrf_day: Decimal,
+    irrf_fii: Decimal,
+    vendas_on_pn: Decimal,          # volume de vendas de ON+PN no mês; define a isenção de 20k
+    vendas_outros: Decimal,         # volume de vendas dos outros tipos swing; soma em G20
+):
+    """Atualiza a aba do mês com os resultados da apuração.
+
+    LÓGICA DE PREENCHIMENTO PARA SWING TRADE:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ Tipo    │ Condição           │ Onde grava o resultado           │
+    ├─────────┼────────────────────┼──────────────────────────────────┤
+    │ ON + PN │ Vendas < 20k       │ J20 (ganho isento)               │
+    │ ON + PN │ Vendas ≥ 20k       │ B15 (tributável)                 │
+    │ BDR     │ sempre             │ B15 (tributável)                 │
+    │ UNITS   │ sempre             │ B15 (tributável)                 │
+    │ ETF     │ sempre             │ B15 (tributável)                 │
+    └─────────┴────────────────────┴──────────────────────────────────┘
+
+    G20 recebe o total de alienações do mês para swing:
+    ON + PN + BDR + UNITS + ETF + demais tipos sem isenção.
+
+    A regra de isenção de 20k, porém, compara apenas vendas_on_pn.
+    """
+    sheet = workbook[sheet_name]
+
+    sheet["A7"] = "INVESTIDOR: " + name
+    sheet["A8"] = "CPF: " + formatar_cpf(cpf)
+
+    # ── Day Trade ──────────────────────────────────────────────────────────────
+    sheet["C15"] = float(result_day)
+    sheet["C36"] = float(irrf_day)
+
+    # ── FII ───────────────────────────────────────────────────────────────────
+    sheet["B49"] = float(result_fii)
+    sheet["B56"] = float(irrf_fii)
+
+    # ── IRRF Swing ────────────────────────────────────────────────────────────
+    sheet["C39"] = float(irrf_swing)
+
+    # ── Swing Trade — ON e PN (lógica de isenção 20k) ─────────────────────────
+    # G20 mostra o total vendido no mês em swing, incluindo ativos sem isenção.
+    # A decisão de isenção continua usando somente vendas_on_pn.
+    sheet["G20"] = float(vendas_on_pn + vendas_outros)
+
+    if vendas_on_pn < LIMITE_ISENCAO_ON_PN:
+        # Abaixo de 20k de vendas: lucro de ON+PN vai para J20 (ganho isento)
+        # B15 recebe APENAS o resultado dos outros tipos (BDR, UNITS, ETF)
+        sheet["J20"] = float(result_swing_on_pn)
+        sheet["B15"] = float(result_swing_outros)
+    else:
+        # Acima de 20k de vendas: lucro de ON+PN também vai para B15 (tributável)
+        # J20 fica zerado (não há ganho isento)
+        sheet["J20"] = 0.0
+        sheet["B15"] = float(result_swing_on_pn + result_swing_outros)
+
+
+def _to_decimal(value) -> Optional[Decimal]:
+    """Converte valor lido do Excel em Decimal."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        return Decimal(str(value))
+    if isinstance(value, str):
+        txt = value.strip()
+        if not txt:
+            return None
+        if "," in txt:
+            txt = txt.replace(".", "").replace(",", ".")
+        try:
+            return Decimal(txt)
+        except Exception:
+            return None
+    return None
+
+
+def read_initial_portfolio_from_year_sheet(
+    workbook,
+    year_sheet_name: str,
+) -> Dict[str, List[Tuple[Decimal, Decimal]]]:
+    """Lê a carteira do mês anterior na aba anual.
+
+    A aba deve ter o cabeçalho 'ATIVOS EM CARTEIRA' com colunas:
+        PAPEL | QUANTIDADE | PREÇO MÉDIO | CUSTO TOTAL
+    """
+    if year_sheet_name not in workbook.sheetnames:
+        raise RuntimeError(
+            f"A aba anual '{year_sheet_name}' não foi encontrada na planilha."
+        )
+
+    sheet      = workbook[year_sheet_name]
+    header_row = None
+    header_col = None
+
+    for row in range(1, sheet.max_row + 1):
+        for col in range(1, sheet.max_column + 1):
+            value = sheet.cell(row=row, column=col).value
+            if isinstance(value, str) and value.strip().lower() == "ativos em carteira":
+                header_row = row
+                header_col = col
+                break
+        if header_row is not None:
+            break
+
+    if header_row is None:
+        raise RuntimeError(
+            f"Cabeçalho 'ATIVOS EM CARTEIRA' não encontrado na aba '{year_sheet_name}'."
+        )
+
+    positions: Dict[str, List[Tuple[Decimal, Decimal]]] = {}
+    row = header_row + 1
+
+    while row <= sheet.max_row:
+        ticker = sheet.cell(row=row, column=header_col).value
+        if ticker is None or (isinstance(ticker, str) and not ticker.strip()):
+            break
+        if isinstance(ticker, str) and "valor total de patrimônio acumulado" in ticker.lower():
+            break
+
+        ticker_str = str(ticker).strip().upper()
+        qty        = _to_decimal(sheet.cell(row=row, column=header_col + 1).value)
+        avg_price  = _to_decimal(sheet.cell(row=row, column=header_col + 2).value)
+
+        if ticker_str and qty is not None and avg_price is not None and qty > 0:
+            positions.setdefault(ticker_str, []).append((qty, avg_price))
+
+        row += 1
+
+    return positions
+
+
+def write_portfolio_sheet_for_month(
+    workbook,
+    month_sheet_name: str,
+    positions: Dict[str, List[Tuple[Decimal, Decimal]]],
+):
+    """Cria/atualiza a aba 'CARTEIRA_MM.AA' com a carteira final do mês."""
+    carteira_sheet_name = f"CARTEIRA_{month_sheet_name}"
+    if carteira_sheet_name in workbook.sheetnames:
+        del workbook[carteira_sheet_name]
+
+    sheet          = workbook.create_sheet(carteira_sheet_name)
+    sheet["A1"]    = "PAPEL"
+    sheet["B1"]    = "QUANTIDADE"
+    sheet["C1"]    = "PREÇO MÉDIO"
+    sheet["D1"]    = "CUSTO TOTAL"
+
+    row = 2
+    for ticker, lots in positions.items():
+        total_qty = sum(q for q, _ in lots)
+        if total_qty == 0:
+            continue
+        total_cost = sum(q * c for q, c in lots)
+        avg_price  = total_cost / total_qty
+
+        sheet.cell(row=row, column=1).value = ticker
+        sheet.cell(row=row, column=2).value = float(total_qty)
+        sheet.cell(row=row, column=3).value = float(avg_price)
+        sheet.cell(row=row, column=4).value = float(total_cost)
+        row += 1
+
+
+###############################################################################
+# Interface Gráfica (Tkinter)
+###############################################################################
+
+class ApuracaoB3App:
+    """Classe principal da aplicação gráfica Tkinter."""
+
+    def __init__(self, master: tk.Tk, base_dir: str):
+        self.master   = master
+        self.base_dir = base_dir
+
+        self.master.title("Calculadora B3 - Notas de Corretagem")
+        W, H = 550, 390
+        self.master.geometry(f"{W}x{H}")
+        self.master.resizable(False, False)
+        self.master.iconbitmap(default=os.path.join(self.base_dir, "icon.ico"))
+
+        self.canvas = tk.Canvas(self.master, width=W, height=H, highlightthickness=0, bd=0)
+        self.canvas.pack(fill="both", expand=True)
+        self._set_background_image("background.png")
+
+        self.investor_name        = tk.StringVar()
+        self.cpf                  = tk.StringVar()
+        self.selected_month_folder = tk.StringVar()
+        self.selected_excel_path  = tk.StringVar()
+
+        # Mapa de senhas por arquivo: {filename: senha}
+        self.password_map: Dict[str, Optional[str]] = {}
+
+        # Mapa de tickers persistente: {nome_do_ativo: ticker}
+        self.ticker_map_path = get_data_path("ticker_map.json")
+        self.ticker_map: Dict[str, str] = load_json_dict(self.ticker_map_path)
+
+        # Mapa de tipos de ativo persistente: {ticker: tipo} (ON, PN, BDR, etc.)
+        # Evita perguntar o mesmo ativo duas vezes em apurações futuras.
+        self.asset_type_map_path = get_data_path("asset_type_map.json")
+        self.asset_type_map: Dict[str, str] = load_json_dict(self.asset_type_map_path)
+
+        # Últimas operações processadas (para exportar debug)
+        self._last_operations: Optional[List[Operation]] = None
+
+        self._build_widgets()
+
+    def _set_background_image(self, image_filename: str):
+        """Define a imagem de fundo da janela."""
+        image_path = resource_path(image_filename)
+        if not os.path.isfile(image_path):
+            return
+        self.master.update_idletasks()
+        w = self.master.winfo_width()
+        h = self.master.winfo_height()
+        img = Image.open(image_path).resize((w, h), Image.LANCZOS)
+        self.bg_image = ImageTk.PhotoImage(img)
+        self.canvas.create_image(0, 0, image=self.bg_image, anchor="nw")
+
+    def _build_widgets(self):
+        """Constrói todos os widgets da interface gráfica."""
+        x_label = 20
+        x_entry = 200
+        y       = 55
+        gap     = 30
+
+        tk.Label(self.master, text="Nome do investidor:", width=23, height=1, font=("Segoe UI", 9, "bold")).place(x=x_label, y=y)
+        tk.Entry(self.master, textvariable=self.investor_name, width=54).place(x=x_entry, y=y)
+
+        y += gap
+        tk.Label(self.master, text="CPF do investidor:", width=23, height=1, font=("Segoe UI", 9, "bold")).place(x=x_label, y=y)
+        tk.Entry(self.master, textvariable=self.cpf, width=54).place(x=x_entry, y=y)
+
+        y += gap + 6
+        tk.Button(self.master, text="Selecione a pasta do mês", command=self._select_folder, width=23, height=1, font=("Segoe UI", 9, "bold")).place(x=x_label, y=y)
+        tk.Entry(self.master, textvariable=self.selected_month_folder, width=54).place(x=x_entry, y=y)
+
+        y += gap + 6
+        tk.Button(self.master, text="Selecione o Excel da apuração", command=self._select_excel, width=23, height=1, font=("Segoe UI", 9, "bold")).place(x=x_label, y=y)
+        tk.Entry(self.master, textvariable=self.selected_excel_path, width=54).place(x=x_entry, y=y)
+
+        y += gap + 20
+        tk.Button(self.master, text="Calcular Apuração", command=self._run_apuracao, width=71, font=("Segoe UI", 9, "bold")).place(x=x_label, y=y)
+
+        # Botão de debug no canto inferior direito; desabilitado até haver apuração
+        self.btn_debug = tk.Button(self.master, text="Exportar Memória de Cálculo", command=self._export_debug, width=21, font=("Segoe UI", 8, "bold"), state="disabled",
+        )
+        self.btn_debug.place(relx=1.0, rely=1.0, anchor="se", x=-15, y=-10)
+
+        y += gap + 14
+        self.status_label = tk.Label(
+            self.master,
+            text="Preencha todos os campos antes de calcular.",
+            font=("Segoe UI", 9, "bold"),
+        )
+        self.status_label.place(x=x_label, y=y)
+
+    # ── Seleção de arquivos/pastas ─────────────────────────────────────────────
+
+    def _select_folder(self):
+        folder = filedialog.askdirectory(title="Selecione a pasta do mês da apuração")
+        if folder:
+            self.selected_month_folder.set(folder)
+
+    def _select_excel(self):
+        file_path = filedialog.askopenfilename(
+            title="Selecione a planilha Excel da apuração",
+            filetypes=[("Arquivos Excel", "*.xlsx *.xlsm"), ("Todos os arquivos", "*.*")],
+        )
+        if file_path:
+            self.selected_excel_path.set(file_path)
+
+    # ── Janelas modais ─────────────────────────────────────────────────────────
+
+    def _pedir_senha_pdf(self, filename: str) -> Optional[str]:
+        """Modal para solicitar a senha de um PDF específico."""
+        win = tk.Toplevel(self.master)
+        win.title("Senha do PDF")
+        win.grab_set()
+
+        tk.Label(
+            win,
+            text=f"O arquivo abaixo está protegido por senha:\n\n{filename}\n\nDigite a senha:",
+            justify="center",
+        ).pack(padx=10, pady=8)
+
+        senha_var = tk.StringVar()
+        tk.Entry(win, textvariable=senha_var, show="*", width=50).pack(padx=10, pady=5)
+
+        result = {"senha": None, "cancelou": False}
+
+        def confirmar():
+            result["senha"] = senha_var.get().strip() or None
+            win.destroy()
+
+        def cancelar():
+            result["cancelou"] = True
+            win.destroy()
+
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(pady=10)
+        tk.Button(btn_frame, text="OK",      command=confirmar, width=12).pack(side="left",  padx=5)
+        tk.Button(btn_frame, text="Cancelar", command=cancelar,  width=12).pack(side="right", padx=5)
+
+        self.master.wait_window(win)
+        return None if result["cancelou"] else result["senha"]
+
+    def _pedir_quantidade_trade(
+        self,
+        note_file: str,
+        ref_date: date,
+        ticker: str,
+        tx_type: str,
+        unit_price: Decimal,
+    ) -> Optional[Decimal]:
+        """Modal para solicitar quantidade de um trade quando não identificada automaticamente."""
+        win = tk.Toplevel(self.master)
+        win.title("Quantidade necessária")
+        win.grab_set()
+
+        msg = (
+            "Não foi possível obter a quantidade desta operação automaticamente.\n\n"
+            f"Arquivo: {note_file}\n"
+            f"Data: {ref_date:%d/%m/%Y}\n"
+            f"Ticker: {ticker}\n"
+            f"Tipo: {tx_type}\n"
+            f"Preço: {unit_price:.2f}\n\n"
+            "Informe a quantidade (apenas o número inteiro):"
+        )
+        tk.Label(win, text=msg, justify="left", anchor="w").pack(padx=10, pady=10)
+
+        qty_var = tk.StringVar()
+        entry = tk.Entry(win, textvariable=qty_var, width=30)
+        entry.pack(padx=10, pady=5)
+        entry.focus_set()
+
+        result = {"qty": None}
+
+        def confirmar():
+            txt = (qty_var.get() or "").strip().replace(".", "")
+            if not txt or not txt.isdigit():
+                messagebox.showwarning("Valor inválido", "Digite apenas números.")
+                return
+            q = int(txt)
+            if q <= 0:
+                messagebox.showwarning("Valor inválido", "A quantidade deve ser maior que zero.")
+                return
+            result["qty"] = Decimal(q)
+            win.destroy()
+
+        def cancelar():
+            win.destroy()
+
+        btn = tk.Frame(win)
+        btn.pack(padx=10, pady=10, fill="x")
+        tk.Button(btn, text="OK",       command=confirmar).pack(side="right")
+        tk.Button(btn, text="Cancelar", command=cancelar).pack(side="left")
+        self.master.wait_window(win)
+        return result["qty"]
+
+    def _pedir_ticker(self, note_file: str, ref_date: date, name: str) -> Optional[str]:
+        """Modal para solicitar o ticker de um ativo não identificado automaticamente."""
+        win = tk.Toplevel(self.master)
+        win.title("Ticker necessário")
+        win.grab_set()
+
+        msg = (
+            "Não foi possível identificar o TICKER automaticamente.\n\n"
+            f"Arquivo: {note_file}\n"
+            f"Data: {ref_date:%d/%m/%Y}\n"
+            f"Ativo (nome na nota): {name}\n\n"
+            "Digite o ticker (ex.: PETR4, VALE3, HGLG11):"
+        )
+        tk.Label(win, text=msg, justify="left", anchor="w").pack(padx=10, pady=10)
+
+        ticker_var = tk.StringVar()
+        entry = tk.Entry(win, textvariable=ticker_var, width=30)
+        entry.pack(padx=10, pady=5)
+        entry.focus_set()
+
+        result = {"ticker": None}
+
+        def confirmar():
+            t = (ticker_var.get() or "").strip().upper()
+            if not t:
+                messagebox.showwarning("Campo obrigatório", "O ticker não pode ficar vazio.")
+                return
+            if not re.fullmatch(r"[A-Z0-9]{4,10}", t):
+                messagebox.showwarning("Ticker inválido", "Use apenas letras e números (ex.: PETR4, HGLG11).")
+                return
+            result["ticker"] = t
+            win.destroy()
+
+        def cancelar():
+            win.destroy()
+
+        btn = tk.Frame(win)
+        btn.pack(padx=10, pady=10, fill="x")
+        tk.Button(btn, text="OK",       command=confirmar).pack(side="right")
+        tk.Button(btn, text="Cancelar", command=cancelar).pack(side="left")
+        self.master.wait_window(win)
+        return result["ticker"]
+
+    def _pedir_tipo_ativo(
+        self,
+        ticker: str,
+        name: str,
+        note_file: str,
+        ref_date: date,
+    ) -> Optional[str]:
+        """Modal para solicitar o tipo do ativo quando a detecção automática falha.
+
+        Exibe botões para cada tipo possível (ON, PN, FII, FIAGRO, BDR, UNITS, ETF).
+        O tipo escolhido é salvo no asset_type_map (JSON) para não perguntar novamente.
+
+        Retorna o identificador canônico do tipo (ex.: "ON"), ou None se o usuário cancelar.
+        """
+        win = tk.Toplevel(self.master)
+        win.title("Tipo do Ativo")
+        win.grab_set()
+        win.resizable(False, False)
+
+        msg = (
+            "Não foi possível identificar automaticamente o tipo do ativo abaixo.\n\n"
+            f"Ticker : {ticker}\n"
+            f"Nome   : {name}\n"
+            f"Arquivo: {note_file}\n"
+            f"Data   : {ref_date:%d/%m/%Y}\n\n"
+            "Selecione o tipo correto:"
+        )
+        tk.Label(win, text=msg, justify="left", anchor="w").pack(padx=15, pady=10)
+
+        # Descrições amigáveis para cada tipo
+        tipos = [
+            (ASSET_TYPE_ON,     "ON  — Ordinária  (tem isenção 20k)"),
+            (ASSET_TYPE_PN,     "PN  — Preferencial  (tem isenção 20k)"),
+            (ASSET_TYPE_FII,    "FII — Fundo Imobiliário  (sem isenção, 20%)"),
+            (ASSET_TYPE_FIAGRO, "FIAGRO — Fundo Agroindustrial  (sem isenção, 20%)"),
+            (ASSET_TYPE_BDR,    "BDR — Recibo negociável  (sem isenção)"),
+            (ASSET_TYPE_UNITS,  "UNITS — Units / UNT  (sem isenção)"),
+            (ASSET_TYPE_ETF,    "ETF — Fundo de índice  (sem isenção)"),
+        ]
+
+        result = {"tipo": None}
+
+        btn_frame = tk.Frame(win)
+        btn_frame.pack(padx=15, pady=5, fill="x")
+
+        for tipo_id, descricao in tipos:
+            def on_click(t=tipo_id):
+                result["tipo"] = t
+                win.destroy()
+            tk.Button(
+                btn_frame,
+                text=descricao,
+                command=on_click,
+                width=48,
+                anchor="w",
+                font=("Segoe UI", 9),
+            ).pack(pady=2)
+
+        def cancelar():
+            win.destroy()
+
+        tk.Button(win, text="Cancelar apuração", command=cancelar,
+                  font=("Segoe UI", 9), fg="red").pack(pady=8)
+
+        self.master.wait_window(win)
+        return result["tipo"]
+
+    def _revisao_manual_nota(
+        self,
+        filename: str,
+        raw_text: str,
+        errors: List[str],
+    ) -> Optional[List[dict]]:
+        """Tela de revisão manual quando todas as camadas automáticas falham.
+
+        Exibe uma tabela visual com uma coluna por campo e uma linha por operação.
+        O usuário preenche as células diretamente, sem precisar decorar um formato
+        de texto separado por ponto-e-vírgula.
+
+        Colunas da tabela:
+            Data (DD/MM/AAAA) | C/V | Ticker | Nome | Quantidade | Preço | Total (opcional)
+
+        Botões:
+            [+ Linha]          → adiciona uma linha em branco ao final da tabela
+            [✕] por linha      → remove aquela linha específica
+            [Confirmar]        → valida e retorna as linhas preenchidas
+            [Cancelar nota]    → cancela o processamento desta nota
+        """
+        win = tk.Toplevel(self.master)
+        win.title("Revisão Manual da Nota")
+        win.grab_set()
+        win.geometry("980x700")
+        win.resizable(True, True)
+
+        result = {"rows": None}
+
+        # ── Cabeçalho informativo ──────────────────────────────────────────────
+        tk.Label(
+            win,
+            text=(
+                f"Nenhum parser conseguiu ler esta nota automaticamente.\n"
+                f"Arquivo: {filename}\n\n"
+                "Preencha as operações na tabela abaixo e informe as taxas totais da nota."
+            ),
+            justify="left",
+            anchor="w",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(fill="x", padx=10, pady=(10, 4))
+
+        # ── Erros das camadas automáticas ─────────────────────────────────────
+        error_text = "\n".join(f"• {e}" for e in errors[-6:])
+        tk.Label(win, text="Erros das camadas automáticas:", anchor="w",
+                 font=("Segoe UI", 8)).pack(fill="x", padx=10)
+        err_box = tk.Text(win, height=4, wrap="word", font=("Segoe UI", 8),
+                          bg="#fff8f0", relief="flat", bd=1)
+        err_box.pack(fill="x", padx=10, pady=(0, 6))
+        err_box.insert("1.0", error_text or "(sem mensagens de erro)")
+        err_box.config(state="disabled")
+
+        # ── Taxas totais da nota ───────────────────────────────────────────────
+        taxas_frame = tk.LabelFrame(win, text="Taxas totais da nota  (deixe 0,00 se não houver)")
+        taxas_frame.pack(fill="x", padx=10, pady=(0, 8))
+
+        taxa_liq_var = tk.StringVar(value="0,00")
+        emol_var     = tk.StringVar(value="0,00")
+        reg_var      = tk.StringVar(value="0,00")
+        transf_var   = tk.StringVar(value="0,00")
+        irrf_var     = tk.StringVar(value="0,00")
+
+        taxa_campos = [
+            ("Taxa liquidação (R$):", taxa_liq_var),
+            ("Emolumentos (R$):",     emol_var),
+            ("Taxa registro (R$):",   reg_var),
+            ("Taxa transferência (R$):", transf_var),
+            ("IRRF (R$):",            irrf_var),
+        ]
+        for col_idx, (lbl, var) in enumerate(taxa_campos):
+            tk.Label(taxas_frame, text=lbl, font=("Segoe UI", 8)).grid(
+                row=0, column=col_idx * 2, sticky="e", padx=(8, 2), pady=4)
+            tk.Entry(taxas_frame, textvariable=var, width=10,
+                     font=("Segoe UI", 8)).grid(
+                row=0, column=col_idx * 2 + 1, sticky="w", padx=(0, 8), pady=4)
+
+        # ── Tabela de operações ────────────────────────────────────────────────
+        # Estrutura: frame com scroll vertical.
+        # Cada linha é uma lista de tk.StringVar + tk.Entry + botão [✕].
+
+        table_outer = tk.LabelFrame(win, text="Operações  (uma linha por operação)")
+        table_outer.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+
+        # Canvas com scrollbar para suportar muitas linhas
+        canvas = tk.Canvas(table_outer, borderwidth=0, highlightthickness=0)
+        vsb    = tk.Scrollbar(table_outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        # Frame interno onde as linhas são colocadas
+        inner = tk.Frame(canvas)
+        canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            # Faz o inner ter sempre a largura do canvas
+            canvas.itemconfig(canvas_window, width=canvas.winfo_width())
+
+        def _on_canvas_configure(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Scroll com mouse wheel
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # Definição das colunas: (chave_interna, texto_cabeçalho, largura_entry)
+        COLUNAS = [
+            ("data",       "Data\n(DD/MM/AAAA)", 12),
+            ("cv",         "C/V\n(C=compra\nV=venda)", 5),
+            ("ticker",     "Ticker\n(ex: PETR4)", 9),
+            ("nome",       "Nome do ativo\n(ex: PETROBRAS ON)", 22),
+            ("quantidade", "Quantidade\n(ex: 100)", 10),
+            ("preco",      "Preço unit.\n(ex: 28,50)", 10),
+            ("total",      "Total R$\n(opcional)", 10),
+        ]
+
+        # Linha de cabeçalho da tabela
+        for col_idx, (_, header_text, _) in enumerate(COLUNAS):
+            tk.Label(
+                inner,
+                text=header_text,
+                font=("Segoe UI", 8, "bold"),
+                bg="#1f4e79",
+                fg="white",
+                relief="flat",
+                anchor="center",
+                justify="center",
+                padx=4, pady=4,
+            ).grid(row=0, column=col_idx, sticky="nsew", padx=1, pady=(2, 1))
+
+        # Cabeçalho da coluna do botão remover
+        tk.Label(
+            inner, text=" ", bg="#1f4e79", fg="white", width=3,
+        ).grid(row=0, column=len(COLUNAS), padx=1, pady=(2, 1))
+
+        # Configura pesos das colunas para que a coluna "nome" expanda
+        for col_idx in range(len(COLUNAS)):
+            inner.columnconfigure(col_idx, weight=1 if col_idx == 3 else 0)
+
+        # Lista de linhas: cada elemento é um dict {chave: StringVar}
+        linhas: List[Dict[str, tk.StringVar]] = []
+
+        def _adicionar_linha(dados: Optional[Dict[str, str]] = None) -> None:
+            """Adiciona uma nova linha de entrada na tabela.
+
+            Se 'dados' for fornecido, preenche as células com os valores.
+            """
+            row_idx = len(linhas) + 1   # +1 porque a linha 0 é o cabeçalho
+            vars_linha: Dict[str, tk.StringVar] = {}
+
+            # Cor de fundo alternada para facilitar leitura visual
+            bg_color = "#f5f9ff" if row_idx % 2 == 0 else "#ffffff"
+
+            for col_idx, (key, _, width) in enumerate(COLUNAS):
+                var = tk.StringVar(value=(dados or {}).get(key, ""))
+                vars_linha[key] = var
+
+                entry = tk.Entry(
+                    inner,
+                    textvariable=var,
+                    width=width,
+                    font=("Segoe UI", 9),
+                    bg=bg_color,
+                    relief="solid",
+                    bd=1,
+                )
+                entry.grid(row=row_idx, column=col_idx, sticky="ew", padx=1, pady=1)
+
+                # Tab para avançar naturalmente entre campos
+                entry.bind("<Tab>", lambda e, w=entry: w.tk_focusNext().focus())
+
+            # Botão para remover esta linha
+            # Usa uma closure para capturar o índice correto
+            def _remover(idx=len(linhas)):
+                _remover_linha(idx)
+
+            btn_rem = tk.Button(
+                inner,
+                text="✕",
+                font=("Segoe UI", 8),
+                fg="#c00000",
+                relief="flat",
+                padx=2,
+                command=_remover,
+            )
+            btn_rem.grid(row=row_idx, column=len(COLUNAS), padx=2, pady=1)
+
+            # Salva o botão junto com as vars para poder reposicioná-lo depois
+            vars_linha["__btn_rem__"] = btn_rem
+            vars_linha["__row_widgets__"] = []   # widgets Entry desta linha
+
+            # Coleta os Entry widgets para poder removê-los depois
+            for col_idx in range(len(COLUNAS)):
+                widget = inner.grid_slaves(row=row_idx, column=col_idx)
+                if widget:
+                    vars_linha["__row_widgets__"].append(widget[0])
+
+            linhas.append(vars_linha)
+
+            # Atualiza scroll
+            inner.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.yview_moveto(1.0)   # rola para o final ao adicionar nova linha
+
+        def _remover_linha(idx: int) -> None:
+            """Remove a linha de índice 'idx' da tabela e reconstrói o layout."""
+            if idx >= len(linhas):
+                return
+
+            # Destrói todos os widgets daquela linha
+            linha = linhas[idx]
+            for w in linha.get("__row_widgets__", []):
+                try:
+                    w.destroy()
+                except Exception:
+                    pass
+            try:
+                linha["__btn_rem__"].destroy()
+            except Exception:
+                pass
+
+            linhas.pop(idx)
+
+            # Reposiciona todas as linhas restantes para fechar o "buraco"
+            for new_idx, l in enumerate(linhas):
+                row_grid = new_idx + 1   # +1 por causa do cabeçalho
+
+                # Atualiza cor de fundo alternada
+                bg_color = "#f5f9ff" if row_grid % 2 == 0 else "#ffffff"
+
+                for col_idx, (key, _, _) in enumerate(COLUNAS):
+                    ws = l.get("__row_widgets__", [])
+                    if col_idx < len(ws):
+                        ws[col_idx].grid(row=row_grid, column=col_idx)
+                        ws[col_idx].config(bg=bg_color)
+
+                # Reposiciona e reconfigura o botão remover com o índice correto
+                def _novo_remover(i=new_idx):
+                    _remover_linha(i)
+
+                l["__btn_rem__"].grid(row=row_grid, column=len(COLUNAS))
+                l["__btn_rem__"].config(command=_novo_remover)
+
+            inner.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        # Começa com 5 linhas em branco
+        for _ in range(5):
+            _adicionar_linha()
+
+        # ── Botões de ação ─────────────────────────────────────────────────────
+        action_frame = tk.Frame(win)
+        action_frame.pack(fill="x", padx=10, pady=6)
+
+        tk.Button(
+            action_frame,
+            text="+ Adicionar linha",
+            command=lambda: _adicionar_linha(),
+            font=("Segoe UI", 9),
+            width=18,
+        ).pack(side="left", padx=5)
+
+        # Texto extraído do PDF: fica num frame expansível no rodapé
+        def _toggle_raw():
+            """Mostra/esconde o texto bruto extraído do PDF."""
+            if raw_frame.winfo_ismapped():
+                raw_frame.pack_forget()
+                btn_raw.config(text="▼ Mostrar texto do PDF")
+            else:
+                raw_frame.pack(fill="both", expand=False, padx=10, pady=(0, 4),
+                               before=action_frame)
+                btn_raw.config(text="▲ Ocultar texto do PDF")
+
+        btn_raw = tk.Button(
+            action_frame,
+            text="▼ Mostrar texto do PDF",
+            command=_toggle_raw,
+            font=("Segoe UI", 8),
+            width=22,
+        )
+        btn_raw.pack(side="left", padx=5)
+
+        tk.Button(
+            action_frame,
+            text="Cancelar nota",
+            command=lambda: (win.destroy(),),
+            font=("Segoe UI", 9),
+            fg="#c00000",
+            width=14,
+        ).pack(side="right", padx=5)
+
+        def confirmar():
+            """Coleta os valores de todas as linhas e chama _parse_manual_review_lines."""
+            try:
+                taxas = {
+                    "settlement_fee":   _parse_decimal_br(taxa_liq_var.get()) or Decimal("0"),
+                    "emoluments":       _parse_decimal_br(emol_var.get())     or Decimal("0"),
+                    "registration_fee": _parse_decimal_br(reg_var.get())      or Decimal("0"),
+                    "transfer_fee":     _parse_decimal_br(transf_var.get())   or Decimal("0"),
+                    "irrf":             _parse_decimal_br(irrf_var.get())      or Decimal("0"),
+                }
+
+                # Monta a lista de dicts a partir das StringVars de cada linha
+                grid_rows = []
+                for linha in linhas:
+                    grid_rows.append({
+                        key: linha[key].get().strip()
+                        for key, _, _ in COLUNAS
+                    })
+
+                result["rows"] = _parse_manual_review_lines(grid_rows, taxas)
+                win.destroy()
+
+            except Exception as exc:
+                messagebox.showerror("Erro ao confirmar operações", str(exc))
+
+        tk.Button(
+            action_frame,
+            text="✔ Confirmar operações",
+            command=confirmar,
+            font=("Segoe UI", 9, "bold"),
+            width=22,
+        ).pack(side="right", padx=5)
+
+        # Frame do texto bruto do PDF (começa oculto)
+        raw_frame = tk.LabelFrame(win, text="Texto extraído do PDF (somente leitura)")
+        raw_box = tk.Text(raw_frame, height=7, wrap="word", font=("Segoe UI", 8))
+        raw_box.pack(fill="both", expand=True, padx=6, pady=4)
+        raw_box.insert("1.0", (raw_text or "")[:12000])
+        raw_box.config(state="disabled")
+        # Não empacota o raw_frame ainda; _toggle_raw() faz isso sob demanda
+
+        self.master.wait_window(win)
+
+        # Limpa o binding do scroll de mouse ao fechar a janela
+        try:
+            canvas.unbind_all("<MouseWheel>")
+        except Exception:
+            pass
+
+        return result["rows"]
+
+    # ── Persistência dos mapas ─────────────────────────────────────────────────
+
+    def _save_ticker_map(self) -> None:
+        save_json_dict(self.ticker_map_path, self.ticker_map)
+
+    def _save_asset_type_map(self) -> None:
+        """Salva o mapa de tipos de ativo no disco para reutilização em sessões futuras."""
+        save_json_dict(self.asset_type_map_path, self.asset_type_map)
+
+    # ── Resolução de tipos de ativo ───────────────────────────────────────────
+
+    def resolve_asset_types(self, operations: List[Operation]) -> None:
+        """Preenche o campo asset_type de todas as operações.
+
+        Estratégia por operação:
+        1. Tenta detect_asset_type() (automático por nome + ticker).
+        2. Se automático falhar, consulta o asset_type_map (JSON persistente).
+        3. Se ainda não encontrar, abre o modal _pedir_tipo_ativo() para o usuário.
+        4. Salva a resposta no asset_type_map para não perguntar novamente.
+
+        Operações de day trade não precisam de tipo para o cálculo de IR
+        (day trade sempre vai para C15, independente de tipo), mas preenchemos
+        assim mesmo para o debug Excel ficar completo.
+        """
+        for op in operations:
+            if op.asset_type:
+                # Já preenchido (ex.: por um parser futuro mais esperto)
+                continue
+
+            ticker = (op.ticker or "").upper().strip()
+
+            # Tenta detecção automática
+            tipo = detect_asset_type(op.name, ticker)
+
+            if tipo is None:
+                # Consulta o mapa persistente pelo ticker
+                tipo = self.asset_type_map.get(ticker)
+
+            if tipo is None:
+                # Pergunta ao usuário
+                tipo = self._pedir_tipo_ativo(
+                    ticker=ticker,
+                    name=op.name,
+                    note_file=op.note_file,
+                    ref_date=op.ref_date,
+                )
+                if tipo is None:
+                    raise RuntimeError(
+                        f"Apuração cancelada: tipo do ativo não informado para '{ticker}' "
+                        f"({op.name}) na nota '{op.note_file}'."
+                    )
+                # Persiste para futuras apurações
+                self.asset_type_map[ticker] = tipo
+                self._save_asset_type_map()
+
+            op.asset_type = tipo
+
+    # ── Exportação de debug Excel ──────────────────────────────────────────────
+
+    def _export_debug(self):
+        """Exporta as operações da última apuração para um Excel de debug."""
+        if not self._last_operations:
+            messagebox.showinfo(
+                "Sem dados",
+                "Nenhuma apuração foi realizada ainda.",
+            )
+            return
+
+        output_path = filedialog.asksaveasfilename(
+            title="Salvar Excel de Debug",
+            defaultextension=".xlsx",
+            filetypes=[("Arquivo Excel", "*.xlsx")],
+            initialfile="Memória_Cálculo.xlsx",
+        )
+        if not output_path:
+            return
+
+        try:
+            export_debug_excel(self._last_operations, output_path)
+            messagebox.showinfo(
+                "Exportação concluída",
+                f"Excel de debug exportado com sucesso:\n{output_path}",
+            )
+        except Exception as exc:
+            messagebox.showerror("Erro ao exportar debug", str(exc))
+            traceback.print_exc()
+
+    # ── Execução principal da apuração ────────────────────────────────────────
+
+    def _run_apuracao(self):
+        """Orquestra todo o fluxo: leitura → tipo de ativo → classificação → cálculo → Excel."""
+        name        = self.investor_name.get().strip()
+        cpf         = self.cpf.get().strip()
+        folder      = self.selected_month_folder.get().strip()
+        excel_path  = self.selected_excel_path.get().strip()
+        cpf_limpo   = re.sub(r"[^\d]", "", cpf)
+
+        if not name or not cpf_limpo or not folder or not excel_path:
+            messagebox.showwarning("Campos pendentes", "Preencha todos os campos antes de calcular.")
+            return
+
+        if not os.path.exists(excel_path):
+            messagebox.showwarning("Excel inválido", "Selecione um arquivo de planilha Excel válido.")
+            return
+
+        if is_file_locked_for_write(excel_path):
+            messagebox.showerror(
+                "Arquivo Excel Aberto",
+                f"Feche o arquivo Excel antes de calcular:\n{os.path.basename(excel_path)}",
+            )
+            self.status_label.config(text="Feche o arquivo Excel antes de calcular.")
+            return
+
+        try:
+            if not validar_cpf(cpf_limpo):
+                messagebox.showwarning("CPF inválido", "O CPF informado é inválido.")
+                return
+
+            parts = os.path.normpath(folder).split(os.sep)
+            if len(parts) < 2:
+                raise ValueError(
+                    "Caminho de pasta inválido. Estrutura esperada: .../<ANO>/<MM.AA>."
+                )
+
+            month_part = parts[-1]
+            year_part  = parts[-2]
+            year       = int(re.sub(r"[^0-9]", "", year_part))
+
+            month_match = re.match(r"^\s*(\d{1,2})(?:[./]\d{2,4})?\s*$", month_part)
+            if not month_match:
+                raise ValueError(
+                    f"O nome da pasta do mês ('{month_part}') é inválido. "
+                    "Use o padrão 'MM.AA' ou 'MM.AAAA'."
+                )
+
+            expected_month = int(month_match.group(1))
+            if expected_month < 1 or expected_month > 12:
+                raise ValueError(f"O mês '{expected_month:02d}' é inválido.")
+
+            year_sheet_name = str(year)
+
+            workbook   = openpyxl.load_workbook(excel_path)
+            sheet_name = resolve_month_sheet_name(workbook, expected_month=expected_month, expected_year=year)
+
+            if year_sheet_name not in workbook.sheetnames:
+                raise RuntimeError(
+                    f"A aba anual '{year_sheet_name}' não foi encontrada na planilha."
+                )
+
+            # 1. Lê as notas (Camada 1 → Camada 2)
+            self.status_label.config(text="Lendo notas de corretagem...")
+            operations = parse_month_folder(
+                month_folder=folder,
+                expected_year=year,
+                expected_month=expected_month,
+                expected_cpf_digits=cpf_limpo,
+                password_map=self.password_map,
+                ask_password_cb=self._pedir_senha_pdf,
+                ask_quantity_cb=self._pedir_quantidade_trade,
+                ask_manual_review_cb=self._revisao_manual_nota,
+            )
+
+            # 2. Resolve tickers ausentes
+            for op in operations:
+                if op.ticker and str(op.ticker).strip():
+                    op.ticker = str(op.ticker).strip().upper()
+                    continue
+                key = op.name
+                if key in self.ticker_map:
+                    op.ticker = self.ticker_map[key]
+                    continue
+                t = self._pedir_ticker(op.note_file, op.ref_date, op.name)
+                if not t:
+                    raise RuntimeError(
+                        f"Apuração cancelada: ticker não informado para '{op.name}'."
+                    )
+                t = t.strip().upper()
+                self.ticker_map[key] = t
+                self._save_ticker_map()
+                op.ticker = t
+
+            # 3. Detecta / solicita o tipo de ativo de cada operação
+            self.status_label.config(text="Identificando tipo dos ativos...")
+            self.resolve_asset_types(operations)
+
+            # 4. Classifica (day / swing / fii)
+            classify_operations(operations)
+
+            # Guarda para exportação de debug
+            self._last_operations = operations
+            self.btn_debug.config(state="normal")
+
+            # 5. Lê carteira anterior
+            self.status_label.config(text="Lendo carteira do mês anterior...")
+            initial_positions = read_initial_portfolio_from_year_sheet(
+                workbook, year_sheet_name=year_sheet_name
+            )
+
+            # 6. Calcula resultados (agora com separação por tipo)
+            self.status_label.config(text="Calculando resultados e carteira...")
+            (
+                result_swing_on_pn, result_swing_outros,
+                result_day, result_fii,
+                irrf_swing, irrf_day, irrf_fii,
+                vendas_on_pn, vendas_outros,
+                updated_positions, has_negative_positions,
+            ) = process_results(operations, initial_positions)
+
+            # 7. Atualiza planilha Excel
+            self.status_label.config(text="Atualizando planilha Excel...")
+            update_month_sheet(
+                workbook,
+                sheet_name=sheet_name,
+                name=name,
+                cpf=cpf_limpo,
+                result_swing_on_pn=result_swing_on_pn,
+                result_swing_outros=result_swing_outros,
+                result_day=result_day,
+                result_fii=result_fii,
+                irrf_swing=irrf_swing,
+                irrf_day=irrf_day,
+                irrf_fii=irrf_fii,
+                vendas_on_pn=vendas_on_pn,
+                vendas_outros=vendas_outros,
+            )
+
+            write_portfolio_sheet_for_month(
+                workbook, month_sheet_name=sheet_name, positions=updated_positions
+            )
+            workbook.save(excel_path)
+
+            if has_negative_positions:
+                messagebox.showwarning(
+                    "Atenção - Carteira com quantidade negativa",
+                    "Há quantidades negativas na carteira calculada.\n"
+                    "Verifique se todas as notas foram importadas corretamente.",
+                )
+
+            self.status_label.config(
+                text=(
+                    f"Apuração de {sheet_name} concluída\n"
+                    f"\n"
+                    f"Resultado Swing Trade: {fmt(result_swing_on_pn + result_swing_outros)}\n"
+                    f"Resultado Day Trade: {fmt(result_day)}\n"
+                    f"Resultado FII: {fmt(result_fii)}"
+                )
+            )
+
+        except Exception as exc:
+            messagebox.showerror("Erro na apuração", str(exc))
+            traceback.print_exc()
+            self.status_label.config(text="Ocorreu um erro durante a apuração.")
+
+
+###############################################################################
+# Ponto de entrada
+###############################################################################
+
+if __name__ == "__main__":
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    root = tk.Tk()
+    app = ApuracaoB3App(root, base_dir=BASE_DIR)
+    root.mainloop()
