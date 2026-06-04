@@ -2,9 +2,8 @@
 CALCULO DE RESULTADOS DE AÇÕES - APURAÇÃO MENSAL B3.
 
 RESUMO:
-- Lê notas de corretagem em PDF de uma pasta específica (uma pasta por mês do ano, ex.: .../2025/01.25).
-- Usa a biblioteca CorrePy como parser principal (padrão B3 Sinacor).
-- Para notas fora do padrão CorrePy, usa um parser próprio com pdfplumber (Camada 2).
+- Lê notas de corretagem em PDF de uma pasta específica (uma pasta por mês do ano, ex.: .../2025/01.25 ou .../01.25).
+- Extrai as operações de compra e venda, taxas e IRRF de cada nota usando uma abordagem em camadas de parsers.
 - Classifica as operações em Day Trade, Swing Trade e FIIs.
 - Detecta o tipo do ativo (ON, PN, FII, BDR, UNITS e ETF) pela descrição; pergunta ao usuário quando não identificado automaticamente.
 - Separa o resultado de swing por tipo para aplicar a regra de isenção de 20k (apenas ON e PN são elegíveis à isenção).
@@ -32,9 +31,11 @@ REGRAS DE CÁLCULO DE RESULTADO E APURAÇÃO:
     - Em G20 ficam o total de alienações dentro do mês ON+PN+BDR+UNITS+ETF.
 
 REGRAS DE PARSER EM CAMADAS:
-    1ª Camada → CorrePy  (tenta identificar o padrão SINACOR CorrePy)
-    2ª Camada → Parser próprio com pdfplumber  (para layouts de corretoras específicas)
-    Se nenhuma camada funcionar, lança RuntimeError com mensagem detalhada.
+    1ª Camada → CorrePy parser padrão, tenta identificar o padrão SINACOR CorrePy
+    2ª Camada → Parser próprio específico para cada corretora com pdfplumber, para notas que não seguem o layout CorrePy
+    3ª Camada → Parser genérico com pdfplumber, tenta extrair operações de notas não-CorrePy sem parser específico, usando heurísticas de texto
+    4ª Camada → Parser manual assistido, para casos onde o parser genérico não consegue extrair as operações corretamente. O usuário pode editar os dados em uma grade visual e o sistema valida a consistência antes de aceitar.
+        
 """
 
 import io
@@ -106,6 +107,8 @@ UNITS_TICKERS_CONHECIDOS = {
 # Mapeamento: fragmento sem formatação → identificador interno (Adicione novos CNPJs aqui conforme necessário)
 BROKER_CNPJ_MAP = {
     "18945670": "inter",     # Inter DTVM Ltda. - CNPJ 18.945.670/0001-46
+    "27652684": "genial",    # Genial CCTVM S/A - CNPJ 27.652.684/0001-62
+    "05816451": "genial",    # Genial CCTVM S/A - CNPJ 05.816.451/0001-15
 }
 
 
@@ -154,6 +157,11 @@ class Operation:
 
 class PdfPasswordRequiredError(RuntimeError):
     """Erro específico para PDF protegido por senha ou senha inválida."""
+    pass
+
+
+class BrokerageNoteValidationError(RuntimeError):
+    """Erro quando a nota foi lida, mas não pertence à apuração informada."""
     pass
 
 
@@ -314,6 +322,11 @@ def _detect_broker(text: str) -> str:
     for cnpj_fragment, broker_name in BROKER_CNPJ_MAP.items():
         if cnpj_fragment in text_digits_only:
             return broker_name
+    text_upper = (text or "").upper()
+    if "GENIAL" in text_upper:
+        return "genial"
+    if "INTER DTVM" in text_upper or "BANCOINTER" in text_upper:
+        return "inter"
     return "unknown"
 
 
@@ -385,7 +398,7 @@ def _validate_rows_against_month_cpf(
     for r in rows:
         rd: date = r["ref_date"]
         if rd.year != expected_year or rd.month != expected_month:
-            raise RuntimeError(
+            raise BrokerageNoteValidationError(
                 f"A nota '{filename}' possui data de pregão {rd:%d/%m/%Y}, "
                 f"que não pertence ao mês {expected_month:02d}/{expected_year}."
             )
@@ -393,7 +406,7 @@ def _validate_rows_against_month_cpf(
         if expected_cpf_digits:
             note_cpf = r.get("cpf") or _extract_cpf_from_pdf(pdf_path, password=password)
             if note_cpf is not None and note_cpf != expected_cpf_digits:
-                raise RuntimeError(
+                raise BrokerageNoteValidationError(
                     f"A nota '{filename}' possui CPF {formatar_cpf(note_cpf)}, "
                     f"diferente do CPF informado {formatar_cpf(expected_cpf_digits)}."
                 )
@@ -419,11 +432,28 @@ def _parse_generic_text_bovespa(pdf_path: str, password: Optional[str] = None) -
     ref_date = _extract_ref_date_from_text(text)
     cpf_digits = _extract_cpf_from_text(text)
 
+    lines = [
+        re.sub(r"\s+", " ", raw_line).strip()
+        for raw_line in text.splitlines()
+        if raw_line and raw_line.strip()
+    ]
+
     settlement_fee   = _extract_fee_from_label_line(text, r"Taxa\s+de\s+Liquidaçã?o|Taxa\s+de\s+Liquidação\s*/\s*CCP")
     registration_fee = _extract_fee_from_label_line(text, r"Taxa\s+de\s+Registro")
     transfer_fee     = _extract_fee_from_label_line(text, r"Taxa\s+de\s+Transfer[eê]ncia\s+de\s+Ativos")
     emoluments       = _extract_fee_from_label_line(text, r"Emolumentos")
     irrf_note        = _extract_fee_from_label_line(text, r"I\.?R\.?R\.?F\.?|IRRF")
+
+    if settlement_fee == 0:
+        settlement_fee = _extract_fee_near_label(lines, r"Taxa\s+de\s+Liquidaçã?o|Taxa\s+de\s+Liquidação\s*/\s*CCP")
+    if registration_fee == 0:
+        registration_fee = _extract_fee_near_label(lines, r"Taxa\s+de\s+Registro")
+    if transfer_fee == 0:
+        transfer_fee = _extract_fee_near_label(lines, r"Taxa\s+de\s+Transfer[eê]ncia\s+de\s+Ativos")
+    if emoluments == 0:
+        emoluments = _extract_fee_near_label(lines, r"Emolumentos")
+    if irrf_note == 0:
+        irrf_note = _extract_fee_near_label(lines, r"I\.?R\.?R\.?F\.?|IRRF")
 
     money = r"(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2,6}"
     qty   = r"\d{1,12}(?:\.\d{3})*"
@@ -515,85 +545,17 @@ def _parse_generic_text_bovespa(pdf_path: str, password: Optional[str] = None) -
         })
 
     if not rows:
-        lines = [
-            re.sub(r"\s+", " ", raw_line).strip()
-            for raw_line in text.splitlines()
-            if raw_line and raw_line.strip()
-        ]
-
-        i = 0
-        while i < len(lines):
-            line_upper = lines[i].upper()
-            if not re.search(r"BOVESPA|B3", line_upper):
-                i += 1
-                continue
-
-            if i + 6 >= len(lines):
-                break
-
-            cv = lines[i + 1].strip().upper()
-            market = lines[i + 2].strip().upper()
-
-            if cv not in ("C", "V"):
-                i += 1
-                continue
-            if not re.search(r"VISTA|VIS|FRACION", market):
-                i += 1
-                continue
-
-            name_parts: List[str] = []
-            j = i + 3
-            while j < len(lines):
-                candidate = lines[j].strip()
-                if re.fullmatch(qty, candidate):
-                    break
-                if re.search(r"RESUMO|TOTAL|LIQUIDO|LÍQUIDO", candidate, re.IGNORECASE):
-                    break
-                name_parts.append(candidate)
-                j += 1
-
-            if (
-                not name_parts
-                or j + 3 >= len(lines)
-                or not re.fullmatch(qty, lines[j].strip())
-                or not re.fullmatch(money, lines[j + 1].strip())
-                or not re.fullmatch(money, lines[j + 2].strip())
-                or lines[j + 3].strip().upper() not in ("C", "D")
-            ):
-                i += 1
-                continue
-
-            name = " ".join(name_parts).strip()
-            ticker_match = re.search(r"\b[A-Z]{4}\d{1,2}[A-Z]?\b", name.upper())
-            ticker = ticker_match.group(0) if ticker_match else None
-
-            amount = _parse_integer_br(lines[j])
-            unit_price = _parse_decimal_br(lines[j + 1])
-            total_value = _parse_decimal_br(lines[j + 2])
-
-            if amount is None or amount <= 0 or unit_price is None or unit_price <= 0:
-                i = j + 4
-                continue
-
-            if total_value is None or total_value <= 0:
-                total_value = amount * unit_price
-
-            rows.append({
-                "ref_date": ref_date,
-                "ticker": ticker,
-                "name": name or ticker or "ATIVO NAO IDENTIFICADO",
-                "transaction_type": "buy" if cv == "C" else "sell",
-                "amount": amount,
-                "unit_price": unit_price,
-                "total_value": total_value,
-                "settlement_fee_note": settlement_fee,
-                "emoluments_note": emoluments,
-                "registration_fee_note": registration_fee,
-                "transfer_fee_note": transfer_fee,
-                "irrf": irrf_note,
-                "cpf": cpf_digits,
-            })
-            i = j + 4
+        rows = _parse_vertical_operation_blocks(
+            lines=lines,
+            ref_date=ref_date,
+            cpf_digits=cpf_digits,
+            settlement_fee=settlement_fee,
+            registration_fee=registration_fee,
+            transfer_fee=transfer_fee,
+            emoluments=emoluments,
+            irrf_note=irrf_note,
+            start_mode="separate_cv",
+        )
 
     if not rows:
         raise RuntimeError(f"Parser genérico: nenhuma operação Bovespa encontrada em '{filename}'.")
@@ -699,6 +661,114 @@ def _parse_manual_review_lines(
     return rows
 
 
+def _parse_vertical_operation_blocks(
+    lines: List[str],
+    ref_date: date,
+    cpf_digits: Optional[str],
+    settlement_fee: Decimal,
+    registration_fee: Decimal,
+    transfer_fee: Decimal,
+    emoluments: Decimal,
+    irrf_note: Decimal,
+    start_mode: str,
+) -> List[dict]:
+    """Lê operações em blocos verticais extraídos do PDF.
+
+    start_mode:
+    - "separate_cv": início em BOVESPA/B3, C/V na linha seguinte.
+    - "inline_cv"  : início com C/V na mesma linha, ex.: B3 RV LISTADO V.
+    """
+    money = r"(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2,6}"
+    qty = r"\d{1,12}(?:\.\d{3})*"
+    rows: List[dict] = []
+
+    i = 0
+    while i < len(lines):
+        line_upper = lines[i].upper()
+
+        if start_mode == "inline_cv":
+            start_match = re.search(r"\bB3\s+RV\s+LISTADO\s+([CV])\b", line_upper)
+            if not start_match:
+                i += 1
+                continue
+            cv = start_match.group(1)
+            market_idx = i + 1
+            name_idx = i + 2
+        else:
+            if not re.search(r"BOVESPA|B3", line_upper):
+                i += 1
+                continue
+            if i + 2 >= len(lines):
+                break
+            cv = lines[i + 1].strip().upper()
+            if cv not in ("C", "V"):
+                i += 1
+                continue
+            market_idx = i + 2
+            name_idx = i + 3
+
+        if market_idx >= len(lines) or not re.search(r"VISTA|VIS|FRACION", lines[market_idx], re.IGNORECASE):
+            i += 1
+            continue
+
+        name_parts: List[str] = []
+        j = name_idx
+        while j < len(lines):
+            candidate = lines[j].strip()
+            if re.fullmatch(qty, candidate):
+                break
+            if re.fullmatch(r"D[#\d]*", candidate.upper()):
+                j += 1
+                break
+            if re.search(r"RESUMO|TOTAL|LIQUIDO|LÍQUIDO", candidate, re.IGNORECASE):
+                break
+            name_parts.append(candidate)
+            j += 1
+
+        if (
+            not name_parts
+            or j + 3 >= len(lines)
+            or not re.fullmatch(qty, lines[j].strip())
+            or not re.fullmatch(money, lines[j + 1].strip())
+            or not re.fullmatch(money, lines[j + 2].strip())
+            or lines[j + 3].strip().upper() not in ("C", "D")
+        ):
+            i += 1
+            continue
+
+        amount = _parse_integer_br(lines[j])
+        unit_price = _parse_decimal_br(lines[j + 1])
+        total_value = _parse_decimal_br(lines[j + 2])
+        if amount is None or amount <= 0 or unit_price is None or unit_price <= 0:
+            i = j + 4
+            continue
+        if total_value is None or total_value <= 0:
+            total_value = amount * unit_price
+
+        name = " ".join(name_parts).strip()
+        ticker_match = re.search(r"\b[A-Z]{4}\d{1,2}[A-Z]?\b", name.upper())
+        ticker = ticker_match.group(0) if ticker_match else None
+
+        rows.append({
+            "ref_date": ref_date,
+            "ticker": ticker,
+            "name": name or ticker or "ATIVO NAO IDENTIFICADO",
+            "transaction_type": "buy" if cv == "C" else "sell",
+            "amount": amount,
+            "unit_price": unit_price,
+            "total_value": total_value,
+            "settlement_fee_note": settlement_fee,
+            "emoluments_note": emoluments,
+            "registration_fee_note": registration_fee,
+            "transfer_fee_note": transfer_fee,
+            "irrf": irrf_note,
+            "cpf": cpf_digits,
+        })
+        i = j + 4
+
+    return rows
+
+
 
 def _parse_inter_pdfplumber(pdf_path: str, password: Optional[str] = None) -> List[dict]:
     """Parser específico para o layout de nota do Banco Inter (Inter DTVM Ltda.).
@@ -793,6 +863,90 @@ def _parse_inter_pdfplumber(pdf_path: str, password: Optional[str] = None) -> Li
         raise RuntimeError("Parser Inter (pdfplumber): nenhuma operação encontrada na tabela da nota.")
 
     return operations
+
+
+def _extract_fee_from_vertical_lines(lines: List[str], label_pattern: str) -> Decimal:
+    """Extrai taxa quando o rótulo e o valor ficam em linhas separadas."""
+    for idx, line in enumerate(lines):
+        if not re.search(label_pattern, line, re.IGNORECASE):
+            continue
+        for candidate in lines[idx + 1:idx + 5]:
+            value = _parse_decimal_br(candidate)
+            if value is not None:
+                return value
+        return Decimal("0")
+    return Decimal("0")
+
+
+def _extract_fee_near_label(lines: List[str], label_pattern: str) -> Decimal:
+    """Extrai taxa em layouts verticais onde o valor pode vir antes ou depois do rótulo."""
+    for idx, line in enumerate(lines):
+        if not re.search(label_pattern, line, re.IGNORECASE):
+            continue
+
+        candidates: List[Tuple[int, Decimal]] = []
+        for distance in range(1, 5):
+            for neighbor_idx in (idx - distance, idx + distance):
+                if neighbor_idx < 0 or neighbor_idx >= len(lines):
+                    continue
+                value = _parse_decimal_br(lines[neighbor_idx])
+                if value is None or value < 0 or value > Decimal("1000"):
+                    continue
+                candidates.append((distance, value))
+
+        if not candidates:
+            return Decimal("0")
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1]
+
+    return Decimal("0")
+
+
+def _parse_genial_pdfplumber(pdf_path: str, password: Optional[str] = None) -> List[dict]:
+    """Parser específico para notas Genial com operações em blocos verticais."""
+    rows: List[dict] = []
+
+    doc = fitz.open(pdf_path)
+    if password:
+        try:
+            doc.authenticate(password)
+        except Exception:
+            pass
+
+    for page in doc:
+        page_text = page.get_text("text")
+        if "GENIAL" not in page_text.upper():
+            continue
+
+        ref_date = _extract_ref_date_from_text(page_text)
+        cpf_digits = _extract_cpf_from_text(page_text)
+        lines = [
+            re.sub(r"\s+", " ", raw_line).strip()
+            for raw_line in page_text.splitlines()
+            if raw_line and raw_line.strip()
+        ]
+
+        settlement_fee   = _extract_fee_from_vertical_lines(lines, r"Taxa\s+de\s+liquidaçã?o")
+        registration_fee = _extract_fee_from_vertical_lines(lines, r"Taxa\s+de\s+Registro")
+        transfer_fee     = _extract_fee_from_vertical_lines(lines, r"Taxa\s+de\s+Transfer[eê]ncia\s+de\s+Ativos")
+        emoluments       = _extract_fee_from_vertical_lines(lines, r"Emolumentos")
+
+        rows.extend(_parse_vertical_operation_blocks(
+            lines=lines,
+            ref_date=ref_date,
+            cpf_digits=cpf_digits,
+            settlement_fee=settlement_fee,
+            registration_fee=registration_fee,
+            transfer_fee=transfer_fee,
+            emoluments=emoluments,
+            irrf_note=Decimal("0"),
+            start_mode="inline_cv",
+        ))
+
+    if not rows:
+        raise RuntimeError("Parser Genial: nenhuma operação encontrada na nota.")
+
+    return rows
 
 
 def _extract_fee_from_label_line(text: str, label_pattern: str) -> Decimal:
@@ -906,36 +1060,49 @@ def _build_operations_from_pdfplumber_rows(
     if not rows:
         return []
 
-    total_value_note = sum(r["total_value"] for r in rows)
-    if total_value_note == 0:
-        raise RuntimeError(
-            f"Parser pdfplumber ({broker}): valor total zerado no arquivo '{filename}'."
-        )
-
-    total_fees = (
-        rows[0].get("settlement_fee_note", Decimal("0"))
-        + rows[0].get("emoluments_note", Decimal("0"))
-        + rows[0].get("registration_fee_note", Decimal("0"))
-        + rows[0].get("transfer_fee_note", Decimal("0"))
-    )
-
     operations: List[Operation] = []
+    groups: Dict[Tuple[date, Decimal, Decimal, Decimal, Decimal], List[dict]] = {}
     for r in rows:
-        proportion = r["total_value"] / total_value_note if total_value_note else Decimal("0")
-        operations.append(Operation(
-            ref_date=r["ref_date"],
-            ticker=r["ticker"],
-            name=r["name"],
-            transaction_type=r["transaction_type"],
-            amount=r["amount"],
-            unit_price=r["unit_price"],
-            total_value=r["total_value"],
-            allocated_fee=total_fees * proportion,
-            irrf=r.get("irrf", Decimal("0")),
-            note_file=filename,
-            asset_type=None,  
-            parser_used=f"pdfplumber_{broker}",
-        ))
+        key = (
+            r["ref_date"],
+            r.get("settlement_fee_note", Decimal("0")),
+            r.get("emoluments_note", Decimal("0")),
+            r.get("registration_fee_note", Decimal("0")),
+            r.get("transfer_fee_note", Decimal("0")),
+        )
+        groups.setdefault(key, []).append(r)
+
+    for (
+        _ref_date,
+        settlement_fee,
+        emoluments,
+        registration_fee,
+        transfer_fee,
+    ), group_rows in groups.items():
+        total_value_note = sum(r["total_value"] for r in group_rows)
+        if total_value_note == 0:
+            raise RuntimeError(
+                f"Parser pdfplumber ({broker}): valor total zerado no arquivo '{filename}'."
+            )
+
+        total_fees = settlement_fee + emoluments + registration_fee + transfer_fee
+
+        for r in group_rows:
+            proportion = r["total_value"] / total_value_note
+            operations.append(Operation(
+                ref_date=r["ref_date"],
+                ticker=r["ticker"],
+                name=r["name"],
+                transaction_type=r["transaction_type"],
+                amount=r["amount"],
+                unit_price=r["unit_price"],
+                total_value=r["total_value"],
+                allocated_fee=total_fees * proportion,
+                irrf=r.get("irrf", Decimal("0")),
+                note_file=filename,
+                asset_type=None,
+                parser_used=f"pdfplumber_{broker}",
+            ))
 
     return operations
 
@@ -992,7 +1159,7 @@ def read_brokerage_notes(
 
                 ref_date = note.reference_date
                 if ref_date.year != expected_year or ref_date.month != expected_month:
-                    raise RuntimeError(
+                    raise BrokerageNoteValidationError(
                         f"A nota '{filename}' possui data de pregão {ref_date:%d/%m/%Y}, "
                         f"que não pertence ao mês {expected_month:02d}/{expected_year}."
                     )
@@ -1004,7 +1171,7 @@ def read_brokerage_notes(
                             f"Não foi possível identificar o CPF do cliente na nota '{filename}'."
                         )
                     if note_cpf != expected_cpf_digits:
-                        raise RuntimeError(
+                        raise BrokerageNoteValidationError(
                             f"A nota '{filename}' possui CPF {formatar_cpf(note_cpf)}, "
                             f"diferente do CPF informado {formatar_cpf(expected_cpf_digits)}."
                         )
@@ -1016,6 +1183,8 @@ def read_brokerage_notes(
             f"PDF protegido por senha ou senha inválida: {filename}"
         ) from e
     except PdfPasswordRequiredError:
+        raise
+    except BrokerageNoteValidationError:
         raise
     except RuntimeError as e:
         if correpy_validating:
@@ -1038,14 +1207,11 @@ def read_brokerage_notes(
 
     # ── 2) PARSER ESPECÍFICO DA CORRETORA ─────────────────────────────────────
     if not _PDFPLUMBER_AVAILABLE:
-        errors.append("pdfplumber: não instalado. Use 'pip install pdfplumber'.")
+        errors.append("Parser específico: biblioteca pdfplumber não instalada.")
     else:
         parser_map = {
             "inter": _parse_inter_pdfplumber,
-            # Futuras corretoras:
-            # "genial": _parse_genial_pdfplumber,
-            # "toro": _parse_toro_pdfplumber,
-            # "xp": _parse_xp_pdfplumber,
+            "genial": _parse_genial_pdfplumber,
         }
 
         specific_parser = parser_map.get(broker)
@@ -1069,6 +1235,8 @@ def read_brokerage_notes(
                 operations = _build_operations_from_pdfplumber_rows(rows, filename, broker)
                 return operations, f"pdfplumber_{broker}"
 
+            except BrokerageNoteValidationError:
+                raise
             except Exception as e:
                 errors.append(f"Parser específico ({broker}): {e}")
 
@@ -1091,6 +1259,8 @@ def read_brokerage_notes(
             op.parser_used = "generic_text"
         return operations, "generic_text"
 
+    except BrokerageNoteValidationError:
+        raise
     except Exception as e:
         errors.append(f"Parser genérico: {e}")
 
@@ -2556,7 +2726,7 @@ class ApuracaoB3App:
             title="Salvar Excel de Debug",
             defaultextension=".xlsx",
             filetypes=[("Arquivo Excel", "*.xlsx")],
-            initialfile="Memória_Cálculo.xlsx",
+            initialfile=f"Memória de Cálculo - {self.investor_name.get().strip()}.xlsx",
         )
         if not output_path:
             return
@@ -2610,13 +2780,24 @@ class ApuracaoB3App:
 
             month_part = parts[-1]
             year_part  = parts[-2]
-            year       = int(re.sub(r"[^0-9]", "", year_part))
 
-            month_match = re.match(r"^\s*(\d{1,2})(?:[./]\d{2,4})?\s*$", month_part)
+            month_match = re.match(r"^\s*(\d{1,2})(?:[./](\d{2}|\d{4}))?\s*$", month_part)
             if not month_match:
                 raise ValueError(
                     f"O nome da pasta do mês ('{month_part}') é inválido. "
                     "Use o padrão 'MM.AA' ou 'MM.AAAA'."
+                )
+
+            year_digits = re.sub(r"[^0-9]", "", year_part)
+            if year_digits:
+                year = int(year_digits)
+            elif month_match.group(2):
+                year_text = month_match.group(2)
+                year = 2000 + int(year_text) if len(year_text) == 2 else int(year_text)
+            else:
+                raise ValueError(
+                    "Não foi possível identificar o ano da apuração pelo caminho da pasta. "
+                    "Use uma estrutura como '.../2025/06.25' ou selecione uma pasta chamada '06.25'."
                 )
 
             expected_month = int(month_match.group(1))
