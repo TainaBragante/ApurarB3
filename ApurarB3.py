@@ -1,5 +1,5 @@
 """
-CALCULO DE RESULTADOS DE AÇÕES - APURAÇÃO MENSAL B3.
+CALCULO DOS RESULTADOS DE AÇÕES - APURAÇÃO MENSAL B3.
 
 RESUMO:
 - Lê notas de corretagem em PDF de uma pasta específica (uma pasta por mês do ano, ex.: .../2025/01.25 ou .../01.25).
@@ -440,8 +440,10 @@ def _parse_generic_text_bovespa(pdf_path: str, password: Optional[str] = None) -
 
     settlement_fee   = _extract_fee_from_label_line(text, r"Taxa\s+de\s+Liquidaçã?o|Taxa\s+de\s+Liquidação\s*/\s*CCP")
     registration_fee = _extract_fee_from_label_line(text, r"Taxa\s+de\s+Registro")
-    transfer_fee     = _extract_fee_from_label_line(text, r"Taxa\s+de\s+Transfer[eê]ncia\s+de\s+Ativos")
+    transfer_fee     = _extract_fee_from_label_line(text, r"Taxa\s+de\s+(?:Transfer[eê]ncia|Transf\.?)\s+de\s+Ativos")
+    ana_fee          = _extract_fee_from_label_line(text, r"Taxa\s+A\.?N\.?A\.?")
     emoluments       = _extract_fee_from_label_line(text, r"Emolumentos")
+    other_fee        = _extract_fee_from_label_line(text, r"Outr[ao]s(?:\s+Bovespa)?")
     irrf_note        = _extract_fee_from_label_line(text, r"I\.?R\.?R\.?F\.?|IRRF")
 
     if settlement_fee == 0:
@@ -449,7 +451,9 @@ def _parse_generic_text_bovespa(pdf_path: str, password: Optional[str] = None) -
     if registration_fee == 0:
         registration_fee = _extract_fee_near_label(lines, r"Taxa\s+de\s+Registro")
     if transfer_fee == 0:
-        transfer_fee = _extract_fee_near_label(lines, r"Taxa\s+de\s+Transfer[eê]ncia\s+de\s+Ativos")
+        transfer_fee = _extract_fee_near_label(lines, r"Taxa\s+de\s+(?:Transfer[eê]ncia|Transf\.?)\s+de\s+Ativos")
+    if ana_fee == 0:
+        ana_fee = _extract_fee_near_label(lines, r"Taxa\s+A\.?N\.?A\.?")
     if emoluments == 0:
         emoluments = _extract_fee_near_label(lines, r"Emolumentos")
     if irrf_note == 0:
@@ -540,6 +544,8 @@ def _parse_generic_text_bovespa(pdf_path: str, password: Optional[str] = None) -
             "emoluments_note": emoluments,
             "registration_fee_note": registration_fee,
             "transfer_fee_note": transfer_fee,
+            "ana_fee_note": ana_fee,
+            "other_fee_note": other_fee,
             "irrf": irrf_note,
             "cpf": cpf_digits,
         })
@@ -552,7 +558,9 @@ def _parse_generic_text_bovespa(pdf_path: str, password: Optional[str] = None) -
             settlement_fee=settlement_fee,
             registration_fee=registration_fee,
             transfer_fee=transfer_fee,
+            ana_fee=ana_fee,
             emoluments=emoluments,
+            other_fee=other_fee,
             irrf_note=irrf_note,
             start_mode="separate_cv",
         )
@@ -648,6 +656,8 @@ def _parse_manual_review_lines(
             "emoluments_note":      taxas.get("emoluments",      Decimal("0")),
             "registration_fee_note": taxas.get("registration_fee", Decimal("0")),
             "transfer_fee_note":    taxas.get("transfer_fee",    Decimal("0")),
+            "ana_fee_note":         taxas.get("ana_fee",         Decimal("0")),
+            "other_fee_note":       taxas.get("other_fee",       Decimal("0")),
             "irrf":                 taxas.get("irrf",            Decimal("0")),
             "cpf": cpf_digits,
         })
@@ -668,7 +678,9 @@ def _parse_vertical_operation_blocks(
     settlement_fee: Decimal,
     registration_fee: Decimal,
     transfer_fee: Decimal,
+    ana_fee: Decimal,
     emoluments: Decimal,
+    other_fee: Decimal,
     irrf_note: Decimal,
     start_mode: str,
 ) -> List[dict]:
@@ -761,6 +773,8 @@ def _parse_vertical_operation_blocks(
             "emoluments_note": emoluments,
             "registration_fee_note": registration_fee,
             "transfer_fee_note": transfer_fee,
+            "ana_fee_note": ana_fee,
+            "other_fee_note": other_fee,
             "irrf": irrf_note,
             "cpf": cpf_digits,
         })
@@ -784,7 +798,8 @@ def _parse_inter_pdfplumber(pdf_path: str, password: Optional[str] = None) -> Li
     Retorna lista de dicts com:
         ref_date, ticker, name, transaction_type, amount, unit_price,
         total_value, settlement_fee_note, emoluments_note,
-        registration_fee_note, transfer_fee_note, irrf, cpf
+        registration_fee_note, transfer_fee_note, ana_fee_note,
+        other_fee_note, irrf, cpf
     """
     open_kwargs = {"password": password} if password else {}
 
@@ -804,8 +819,10 @@ def _parse_inter_pdfplumber(pdf_path: str, password: Optional[str] = None) -> Li
     # Extrai taxas do Resumo Financeiro
     settlement_fee   = _extract_fee_from_label_line(full_text, r"Taxa\s+de\s+Liquidaçã?o")
     registration_fee = _extract_fee_from_label_line(full_text, r"Taxa\s+de\s+Registro\s*\(\d+\)\s*([\d.,]+)")
-    transfer_fee     = _extract_fee_from_label_line(full_text, r"Taxa\s+de\s+Transfer[eê]ncia\s+de\s+Ativos\s+([\d.,]+)")
+    transfer_fee     = _extract_fee_from_label_line(full_text, r"Taxa\s+de\s+(?:Transfer[eê]ncia|Transf\.?)\s+de\s+Ativos\s+([\d.,]+)")
+    ana_fee          = _extract_fee_from_label_line(full_text, r"Taxa\s+A\.?N\.?A\.?")
     emoluments       = _extract_fee_from_label_line(full_text, r"Emolumentos\s+([\d.,]+)")
+    other_fee        = _extract_fee_from_label_line(full_text, r"Outr[ao]s(?:\s+Bovespa)?")
     irrf_note        = _extract_fee_from_label_line(full_text, r"I\.R\.R\.F?\s+([\d.,]+)")
 
     # Extrai operações da tabela
@@ -855,6 +872,8 @@ def _parse_inter_pdfplumber(pdf_path: str, password: Optional[str] = None) -> Li
                         "emoluments_note": emoluments,
                         "registration_fee_note": registration_fee,
                         "transfer_fee_note": transfer_fee,
+                        "ana_fee_note": ana_fee,
+                        "other_fee_note": other_fee,
                         "irrf": irrf_note,
                         "cpf": cpf_digits,
                     })
@@ -874,7 +893,7 @@ def _extract_fee_from_vertical_lines(lines: List[str], label_pattern: str) -> De
             value = _parse_decimal_br(candidate)
             if value is not None:
                 return value
-        return Decimal("0")
+        continue
     return Decimal("0")
 
 
@@ -895,9 +914,67 @@ def _extract_fee_near_label(lines: List[str], label_pattern: str) -> Decimal:
                 candidates.append((distance, value))
 
         if not candidates:
-            return Decimal("0")
+            continue
         candidates.sort(key=lambda item: item[0])
         return candidates[0][1]
+
+    return Decimal("0")
+
+
+def _extract_fee_by_ref_date_from_pdf(
+    pdf_path: str,
+    password: Optional[str],
+    label_pattern: str,
+) -> Dict[date, Decimal]:
+    """Extrai uma taxa por data de pregão em PDFs com várias notas no mesmo arquivo."""
+    fees_by_date: Dict[date, Decimal] = {}
+
+    doc = fitz.open(pdf_path)
+    if password:
+        try:
+            doc.authenticate(password)
+        except Exception:
+            pass
+
+    for page in doc:
+        page_text = page.get_text("text")
+        try:
+            ref_date = _extract_ref_date_from_text(page_text)
+        except RuntimeError:
+            continue
+
+        lines = [
+            re.sub(r"\s+", " ", raw_line).strip()
+            for raw_line in page_text.splitlines()
+            if raw_line and raw_line.strip()
+        ]
+        fee = _extract_fee_from_label_line(page_text, label_pattern)
+        if fee == 0:
+            fee = _extract_fee_near_label(lines, label_pattern)
+
+        current = fees_by_date.get(ref_date)
+        if current is None or (current == 0 and fee != 0):
+            fees_by_date[ref_date] = fee
+
+    doc.close()
+    return fees_by_date
+
+
+def _extract_irrf_from_lines(lines: List[str]) -> Decimal:
+    """Extrai IRRF de linhas como 'I.R.R.F Day Trade: ... Projeção R$ 0,11'."""
+    for line in lines:
+        if not re.search(r"I\.?R\.?R\.?F\.?|IRRF", line, re.IGNORECASE):
+            continue
+
+        projection = re.search(r"Projeç[aã]o\s+R\$\s*([\d.,-]+)", line, re.IGNORECASE)
+        if projection:
+            value = _parse_decimal_br(projection.group(1))
+            return value if value is not None and value > 0 else Decimal("0")
+
+        values = re.findall(r"-?\d{1,3}(?:\.\d{3})*,\d+|-?\d+,\d+", line)
+        if values:
+            value = _parse_decimal_br(values[-1])
+            return value if value is not None and value > 0 else Decimal("0")
 
     return Decimal("0")
 
@@ -928,8 +1005,11 @@ def _parse_genial_pdfplumber(pdf_path: str, password: Optional[str] = None) -> L
 
         settlement_fee   = _extract_fee_from_vertical_lines(lines, r"Taxa\s+de\s+liquidaçã?o")
         registration_fee = _extract_fee_from_vertical_lines(lines, r"Taxa\s+de\s+Registro")
-        transfer_fee     = _extract_fee_from_vertical_lines(lines, r"Taxa\s+de\s+Transfer[eê]ncia\s+de\s+Ativos")
+        transfer_fee     = _extract_fee_from_vertical_lines(lines, r"Taxa\s+de\s+(?:Transfer[eê]ncia|Transf\.?)\s+de\s+Ativos")
+        ana_fee          = _extract_fee_from_vertical_lines(lines, r"Taxa\s+A\.?N\.?A\.?")
         emoluments       = _extract_fee_from_vertical_lines(lines, r"Emolumentos")
+        other_fee        = _extract_fee_from_vertical_lines(lines, r"Outr[ao]s(?:\s+Bovespa)?")
+        irrf_note        = _extract_irrf_from_lines(lines)
 
         rows.extend(_parse_vertical_operation_blocks(
             lines=lines,
@@ -938,8 +1018,10 @@ def _parse_genial_pdfplumber(pdf_path: str, password: Optional[str] = None) -> L
             settlement_fee=settlement_fee,
             registration_fee=registration_fee,
             transfer_fee=transfer_fee,
+            ana_fee=ana_fee,
             emoluments=emoluments,
-            irrf_note=Decimal("0"),
+            other_fee=other_fee,
+            irrf_note=irrf_note,
             start_mode="inline_cv",
         ))
 
@@ -957,7 +1039,7 @@ def _extract_fee_from_label_line(text: str, label_pattern: str) -> Decimal:
             continue
         values = re.findall(money_pattern, line)
         if not values:
-            return Decimal("0")
+            continue
         val = _parse_decimal_br(values[-1])
         return val if val is not None else Decimal("0")
     return Decimal("0")
@@ -1055,13 +1137,15 @@ def _build_operations_from_pdfplumber_rows(
 
     O rateio de taxas é proporcional ao valor financeiro de cada operação,
     idêntico ao que é feito para notas SINACOR (CorrePy).
+    O IRRF é imposto retido da nota: não entra nas taxas, mas é rateado
+    proporcionalmente após o valor financeiro das operações estar definido.
     O campo asset_type é deixado None; será preenchido depois por resolve_asset_types().
     """
     if not rows:
         return []
 
     operations: List[Operation] = []
-    groups: Dict[Tuple[date, Decimal, Decimal, Decimal, Decimal], List[dict]] = {}
+    groups: Dict[Tuple[date, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal], List[dict]] = {}
     for r in rows:
         key = (
             r["ref_date"],
@@ -1069,6 +1153,9 @@ def _build_operations_from_pdfplumber_rows(
             r.get("emoluments_note", Decimal("0")),
             r.get("registration_fee_note", Decimal("0")),
             r.get("transfer_fee_note", Decimal("0")),
+            r.get("ana_fee_note", Decimal("0")),
+            r.get("other_fee_note", Decimal("0")),
+            r.get("irrf", Decimal("0")),
         )
         groups.setdefault(key, []).append(r)
 
@@ -1078,6 +1165,9 @@ def _build_operations_from_pdfplumber_rows(
         emoluments,
         registration_fee,
         transfer_fee,
+        ana_fee,
+        other_fee,
+        irrf_note,
     ), group_rows in groups.items():
         total_value_note = sum(r["total_value"] for r in group_rows)
         if total_value_note == 0:
@@ -1085,8 +1175,10 @@ def _build_operations_from_pdfplumber_rows(
                 f"Parser pdfplumber ({broker}): valor total zerado no arquivo '{filename}'."
             )
 
-        total_fees = settlement_fee + emoluments + registration_fee + transfer_fee
-
+        total_fees = (
+            settlement_fee + registration_fee + ana_fee
+            + emoluments + transfer_fee + other_fee
+        )
         for r in group_rows:
             proportion = r["total_value"] / total_value_note
             operations.append(Operation(
@@ -1098,7 +1190,7 @@ def _build_operations_from_pdfplumber_rows(
                 unit_price=r["unit_price"],
                 total_value=r["total_value"],
                 allocated_fee=total_fees * proportion,
-                irrf=r.get("irrf", Decimal("0")),
+                irrf=irrf_note * proportion,
                 note_file=filename,
                 asset_type=None,
                 parser_used=f"pdfplumber_{broker}",
@@ -1374,6 +1466,12 @@ def parse_month_folder(
         if source == "correpy":
             notes = result
             raw_text_for_quantity: Optional[str] = None
+            transfer_fee_pattern = r"Taxa\s+de\s+(?:Transfer[eê]ncia|Transf\.?)\s+de\s+Ativos"
+            transfer_fee_by_date = _extract_fee_by_ref_date_from_pdf(
+                pdf_path,
+                senha_arquivo,
+                transfer_fee_pattern,
+            )
             for note in notes:
                 corrected_amounts: List[Decimal] = []
                 corrected_tx_values: List[Decimal] = []
@@ -1427,11 +1525,29 @@ def parse_month_folder(
                         f"O arquivo '{filename}' gerou valor total inválido (0)."
                     )
 
+                if raw_text_for_quantity is None:
+                    raw_text_for_quantity = _extract_text_from_pdf(pdf_path, password=senha_arquivo)
+                transfer_fee_note = transfer_fee_by_date.get(note.reference_date, Decimal("0"))
+                if note.reference_date not in transfer_fee_by_date:
+                    transfer_fee_note = _extract_fee_from_label_line(
+                        raw_text_for_quantity,
+                        transfer_fee_pattern,
+                    )
+                if transfer_fee_note == 0 and note.reference_date not in transfer_fee_by_date:
+                    transfer_fee_note = _extract_fee_near_label(
+                        [
+                            re.sub(r"\s+", " ", line).strip()
+                            for line in raw_text_for_quantity.splitlines()
+                            if line and line.strip()
+                        ],
+                        transfer_fee_pattern,
+                    )
+
                 total_fees = (
-                    note.settlement_fee + note.registration_fee + note.term_fee
-                    + note.ana_fee + note.emoluments + note.operational_fee
-                    + note.execution + note.custody_fee + note.taxes + note.others
+                    note.settlement_fee + note.registration_fee + note.ana_fee
+                    + note.emoluments + transfer_fee_note + note.others
                 )
+                note_irrf = getattr(note, "irrf", Decimal("0")) or Decimal("0")
 
                 for idx, tx in enumerate(note.transactions):
                     amount = corrected_amounts[idx]
@@ -1447,7 +1563,7 @@ def parse_month_folder(
                         unit_price=tx.unit_price,
                         total_value=tx_value,
                         allocated_fee=total_fees * proportion,
-                        irrf=tx.source_withheld_taxes,
+                        irrf=note_irrf * proportion,
                         note_file=filename,
                         asset_type=None,  # preenchido depois
                         parser_used="correpy",
@@ -1819,8 +1935,8 @@ def resolve_month_sheet_name(workbook, expected_month: int, expected_year: int) 
 
     if not matches:
         raise RuntimeError(
-            f"Nenhuma aba do mês {expected_month:02d}/{expected_year} foi encontrada na planilha. "
-            "Use um destes padrões: MM.AA, MM.AAAA, MM/AA ou MM/AAAA."
+            f"Nenhuma aba do mês {expected_month:02d}/{expected_year} foi encontrada na planilha de apuração. "
+            "Use um destes padrões: MM/AA ou MM/AAAA."
         )
     if len(matches) > 1:
         raise RuntimeError(
@@ -2273,8 +2389,8 @@ class ApuracaoB3App:
         tipos = [
             (ASSET_TYPE_ON,     "ON  — Ordinária  (tem isenção 20k)"),
             (ASSET_TYPE_PN,     "PN  — Preferencial  (tem isenção 20k)"),
-            (ASSET_TYPE_FII,    "FII — Fundo Imobiliário  (sem isenção, 20%)"),
-            (ASSET_TYPE_FIAGRO, "FIAGRO — Fundo Agroindustrial  (sem isenção, 20%)"),
+            (ASSET_TYPE_FII,    "FII — Fundo Imobiliário  (sem isenção)"),
+            (ASSET_TYPE_FIAGRO, "FIAGRO — Fundo Agroindustrial  (sem isenção)"),
             (ASSET_TYPE_BDR,    "BDR — Recibo negociável  (sem isenção)"),
             (ASSET_TYPE_UNITS,  "UNITS — Units / UNT  (sem isenção)"),
             (ASSET_TYPE_ETF,    "ETF — Fundo de índice  (sem isenção)"),
@@ -2367,21 +2483,27 @@ class ApuracaoB3App:
         emol_var     = tk.StringVar(value="0,00")
         reg_var      = tk.StringVar(value="0,00")
         transf_var   = tk.StringVar(value="0,00")
+        ana_var      = tk.StringVar(value="0,00")
+        outras_var   = tk.StringVar(value="0,00")
         irrf_var     = tk.StringVar(value="0,00")
 
         taxa_campos = [
             ("Taxa liquidação (R$):", taxa_liq_var),
-            ("Emolumentos (R$):",     emol_var),
             ("Taxa registro (R$):",   reg_var),
+            ("Taxa A.N.A. (R$):",     ana_var),
+            ("Emolumentos (R$):",     emol_var),
             ("Taxa transferência (R$):", transf_var),
+            ("Outros (R$):",          outras_var),
             ("IRRF (R$):",            irrf_var),
         ]
         for col_idx, (lbl, var) in enumerate(taxa_campos):
+            row_idx = col_idx // 4
+            pair_col = (col_idx % 4) * 2
             tk.Label(taxas_frame, text=lbl, font=("Segoe UI", 8)).grid(
-                row=0, column=col_idx * 2, sticky="e", padx=(8, 2), pady=4)
+                row=row_idx, column=pair_col, sticky="e", padx=(8, 2), pady=4)
             tk.Entry(taxas_frame, textvariable=var, width=10,
                      font=("Segoe UI", 8)).grid(
-                row=0, column=col_idx * 2 + 1, sticky="w", padx=(0, 8), pady=4)
+                row=row_idx, column=pair_col + 1, sticky="w", padx=(0, 8), pady=4)
 
         # ── Tabela de operações ────────────────────────────────────────────────
         # Estrutura: frame com scroll vertical.
@@ -2611,6 +2733,8 @@ class ApuracaoB3App:
                     "emoluments":       _parse_decimal_br(emol_var.get())     or Decimal("0"),
                     "registration_fee": _parse_decimal_br(reg_var.get())      or Decimal("0"),
                     "transfer_fee":     _parse_decimal_br(transf_var.get())   or Decimal("0"),
+                    "ana_fee":          _parse_decimal_br(ana_var.get())      or Decimal("0"),
+                    "other_fee":        _parse_decimal_br(outras_var.get())   or Decimal("0"),
                     "irrf":             _parse_decimal_br(irrf_var.get())      or Decimal("0"),
                 }
 
