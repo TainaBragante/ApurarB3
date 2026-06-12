@@ -805,6 +805,11 @@ def _parse_inter_pdfplumber(pdf_path: str, password: Optional[str] = None) -> Li
 
     with pdfplumber.open(pdf_path, **open_kwargs) as pdf:
         full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    lines = [
+        re.sub(r"\s+", " ", raw_line).strip()
+        for raw_line in full_text.splitlines()
+        if raw_line and raw_line.strip()
+    ]
 
     # Extrai data do pregão: "Data pregão: DD/MM/AAAA"
     date_match = re.search(r"Data\s+preg[aã]o[:\s]+(\d{2}/\d{2}/\d{4})", full_text, re.IGNORECASE)
@@ -823,7 +828,7 @@ def _parse_inter_pdfplumber(pdf_path: str, password: Optional[str] = None) -> Li
     ana_fee          = _extract_fee_from_label_line(full_text, r"Taxa\s+A\.?N\.?A\.?")
     emoluments       = _extract_fee_from_label_line(full_text, r"Emolumentos\s+([\d.,]+)")
     other_fee        = _extract_fee_from_label_line(full_text, r"Outr[ao]s(?:\s+Bovespa)?")
-    irrf_note        = _extract_fee_from_label_line(full_text, r"I\.R\.R\.F?\s+([\d.,]+)")
+    irrf_note        = _extract_irrf_from_lines(lines)
 
     # Extrai operações da tabela
     operations: List[dict] = []
@@ -904,7 +909,7 @@ def _extract_fee_near_label(lines: List[str], label_pattern: str) -> Decimal:
             continue
 
         candidates: List[Tuple[int, Decimal]] = []
-        for distance in range(1, 5):
+        for distance in range(1, 3):
             for neighbor_idx in (idx - distance, idx + distance):
                 if neighbor_idx < 0 or neighbor_idx >= len(lines):
                     continue
@@ -961,8 +966,8 @@ def _extract_fee_by_ref_date_from_pdf(
 
 
 def _extract_irrf_from_lines(lines: List[str]) -> Decimal:
-    """Extrai IRRF de linhas como 'I.R.R.F Day Trade: ... Projeção R$ 0,11'."""
-    for line in lines:
+    """Extrai IRRF, ignorando o valor da base de cálculo quando ele aparece na linha."""
+    for idx, line in enumerate(lines):
         if not re.search(r"I\.?R\.?R\.?F\.?|IRRF", line, re.IGNORECASE):
             continue
 
@@ -970,6 +975,13 @@ def _extract_irrf_from_lines(lines: List[str]) -> Decimal:
         if projection:
             value = _parse_decimal_br(projection.group(1))
             return value if value is not None and value > 0 else Decimal("0")
+
+        if re.search(r"base\s+R\$", line, re.IGNORECASE):
+            for candidate in lines[idx + 1:idx + 5]:
+                value = _parse_decimal_br(candidate)
+                if value is not None and value >= 0:
+                    return value
+            return Decimal("0")
 
         values = re.findall(r"-?\d{1,3}(?:\.\d{3})*,\d+|-?\d+,\d+", line)
         if values:
@@ -1466,7 +1478,7 @@ def parse_month_folder(
         if source == "correpy":
             notes = result
             raw_text_for_quantity: Optional[str] = None
-            transfer_fee_pattern = r"Taxa\s+de\s+(?:Transfer[eê]ncia|Transf\.?)\s+de\s+Ativos"
+            transfer_fee_pattern = r"Taxa\s+de\s+(?:Transfer[eê]ncia|Tranfer[eê]ncia|Transf\.?)\s+de\s+Ativos"
             transfer_fee_by_date = _extract_fee_by_ref_date_from_pdf(
                 pdf_path,
                 senha_arquivo,
@@ -1545,7 +1557,7 @@ def parse_month_folder(
 
                 total_fees = (
                     note.settlement_fee + note.registration_fee + note.ana_fee
-                    + note.emoluments + transfer_fee_note + note.others
+                    + note.emoluments + transfer_fee_note + note.operational_fee + note.others
                 )
                 note_irrf = getattr(note, "irrf", Decimal("0")) or Decimal("0")
 
@@ -1711,6 +1723,11 @@ def process_results(
 
         ticker = op.ticker.strip().upper()
 
+        if op.category == "fii":
+            irrf_fii += (op.irrf or Decimal(0))
+        elif op.category == "swing":
+            irrf_swing += (op.irrf or Decimal(0))
+
         if op.transaction_type == "buy":
             purchase_cost = (op.unit_price * op.amount) + op.allocated_fee
             current_qty, current_avg = (
@@ -1758,7 +1775,6 @@ def process_results(
 
             if op.category == "fii":
                 result_fii += profit
-                irrf_fii   += op.irrf
 
             elif op.category == "swing":
                 # Separa o resultado pelo tipo do ativo para a regra de isenção
@@ -1772,8 +1788,6 @@ def process_results(
                     # BDR, UNITS, ETF, ou tipo desconhecido: sempre tributável
                     result_swing_outros += profit
                     vendas_outros       += sale_value
-
-                irrf_swing += op.irrf
 
     # Processa Day Trade
     for _, ops_day in day_groups.items():
