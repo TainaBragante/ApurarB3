@@ -1,43 +1,3 @@
-"""
-CALCULO DOS RESULTADOS DE AÇÕES - APURAÇÃO MENSAL B3.
-
-RESUMO:
-- Lê notas de corretagem em PDF de uma pasta específica (uma pasta por mês do ano, ex.: .../2025/01.25 ou .../01.25).
-- Extrai as operações de compra e venda, taxas e IRRF de cada nota usando uma abordagem em camadas de parsers.
-- Classifica as operações em Day Trade, Swing Trade e FIIs.
-- Detecta o tipo do ativo (ON, PN, FII, BDR, UNITS e ETF) pela descrição; pergunta ao usuário quando não identificado automaticamente.
-- Separa o resultado de swing por tipo para aplicar a regra de isenção de 20k (apenas ON e PN são elegíveis à isenção).
-- O resultado de day trade é calculado separadamente, sem isenção independentemente do tipo de ativo.
-- Calcula os resultados líquidos por tipo de operação, considerando taxas e IRRF.
-- Atualiza a planilha Excel padrão com o resultado da apuração mensal.
-- Monta a carteira final do mês e grava em uma nova aba "CARTEIRA_MM.AA".
-- Permite exportar um Excel de debug (memória de cálculo) com todas as operações lidas.
-
-REGRAS DE TIPO DE ATIVO E ISENÇÃO:
-    ON  (Ordinária)    → TEM isenção 20k  → células B15 + G20 (se ≥20k) e células J20 e G20 (se <20k)
-    PN  (Preferencial) → TEM isenção 20k  → células B15 + G20 (se ≥20k) e células J20 e G20 (se <20k)
-    FII / FIAGRO       → NÃO tem isenção  → vai para B49 diretamente 
-    BDR / DRN          → NÃO tem isenção  → vai para B15 diretamente
-    UNITS / UNT / UN   → NÃO tem isenção  → vai para B15 diretamente
-    ETF                → NÃO tem isenção  → vai para B15 diretamente
-
-REGRAS DE CÁLCULO DE RESULTADO E APURAÇÃO:
-    - Soma as VENDAS de ON+PN do mês:
-   Se total de vendas ON+PN < R$20.000 → lucro vai para J20 (ganho isento).
-   Se total de vendas ON+PN ≥ R$20.000 → lucro vai para B15 (tributável a 15%).
-    - Independente da regra acima - BDR, UNITS e ETF sempre vão para B15 sem isenção (tributável a 15%).
-    - Independente da regra acima - FIIs sempre vão para B49 com sem isenção (tributável a 20%).
-    - O resultado final da apuração mensal é a soma de B15 (lucro tributável -> ON+PN+BDR+UNITS+ETF) + B49 (lucro FII)
-    - Em G20 ficam o total de alienações dentro do mês ON+PN+BDR+UNITS+ETF.
-
-REGRAS DE PARSER EM CAMADAS:
-    1ª Camada → CorrePy parser padrão, tenta identificar o padrão SINACOR CorrePy
-    2ª Camada → Parser próprio específico para cada corretora com pdfplumber, para notas que não seguem o layout CorrePy
-    3ª Camada → Parser genérico com pdfplumber, tenta extrair operações de notas não-CorrePy sem parser específico, usando heurísticas de texto
-    4ª Camada → Parser manual assistido, para casos onde o parser genérico não consegue extrair as operações corretamente. O usuário pode editar os dados em uma grade visual e o sistema valida a consistência antes de aceitar.
-        
-"""
-
 import io
 import os
 import re
@@ -56,13 +16,7 @@ from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 from correpy.parsers.brokerage_notes.parser_factory import ParserFactory
 from correpy.parsers.exceptions import InvalidPasswordException
-
-# pdfplumber é usado pelo parser da Camada 2 (layouts não-CorrePy)
-try:
-    import pdfplumber
-    _PDFPLUMBER_AVAILABLE = True
-except ImportError:
-    _PDFPLUMBER_AVAILABLE = False
+import pdfplumber
 
 
 ###############################################################################
@@ -104,7 +58,7 @@ UNITS_TICKERS_CONHECIDOS = {
 }
 
 # Fragmentos de CNPJ para detecção de corretoras não-CorrePy
-# Mapeamento: fragmento sem formatação → identificador interno (Adicione novos CNPJs aqui conforme necessário)
+# Mapeamento: fragmento sem formatação → identificador interno 
 BROKER_CNPJ_MAP = {
     "18945670": "inter",     # Inter DTVM Ltda. - CNPJ 18.945.670/0001-46
     "27652684": "genial",    # Genial CCTVM S/A - CNPJ 27.652.684/0001-62
@@ -113,7 +67,7 @@ BROKER_CNPJ_MAP = {
 
 
 ###############################################################################
-# Estrutura de dados para operações
+# ESTRUTURA DE DADOS PARA OPERAÇÕES
 ###############################################################################
 
 @dataclass
@@ -152,7 +106,97 @@ class Operation:
 
 
 ###############################################################################
-# Funções auxiliares gerais
+# CAMADA 1 — CORREPY (parser principal via biblioteca)
+###############################################################################
+
+# Estrutura normalizada para as taxas do Resumo Financeiro das notas SINACOR.
+@dataclass
+class FinancialSummary:
+    settlement_fee: Decimal = Decimal("0")   # Taxa de liquidação
+    registration_fee: Decimal = Decimal("0") # Taxa de registro
+    transfer_fee: Decimal = Decimal("0")     # Taxa de transferência de ativos
+    ana_fee: Decimal = Decimal("0")          # Taxa ANA
+    emoluments: Decimal = Decimal("0")       # Emolumentos
+    operational_fee: Decimal = Decimal("0")  # Taxa operacional
+    execution_fee: Decimal = Decimal("0")    # Execução
+    custody_fee: Decimal = Decimal("0")      # Taxa de custódia
+    taxes: Decimal = Decimal("0")            # Impostos
+    other_fee: Decimal = Decimal("0")        # Outras
+    irrf: Decimal = Decimal("0")             # IRRF
+
+    source: str = ""
+    warnings: list = field(default_factory=list)
+
+    def total_allocatable_fees(self, include_transfer_fee: bool = True) -> Decimal:
+        """Soma apenas taxas que entram no rateio das operações."""
+        base = (
+            self.settlement_fee + self.registration_fee +
+            self.ana_fee + self.emoluments + self.operational_fee +
+            self.execution_fee + self.custody_fee +
+            self.taxes + self.other_fee
+        )
+        if include_transfer_fee:
+            base += self.transfer_fee
+        return base
+
+    def has_any_fee(self) -> bool:
+        """Retorna True se pelo menos um campo de taxa foi extraído com valor não-zero."""
+        return self.total_allocatable_fees() > Decimal("0") or self.irrf > Decimal("0")
+
+
+# Padrões centralizados dos rótulos de taxas aceitos no Resumo Financeiro.
+FEE_LABEL_PATTERNS = {
+    "settlement_fee": [
+        r"Taxa\s+de\s+liquida[cç][aã]o",
+        r"Taxa\s+de\s+liquida[cç][aã]o\s*/\s*CCP",
+    ],
+    "registration_fee": [
+        r"Taxa\s+de\s+Registro",
+    ],
+    "transfer_fee": [
+        r"Taxa\s+de\s+(?:Transfer[eê]ncia|Tranfer[eê]ncia|Transf\.?)\s+de\s+Ativos",
+    ],
+    "emoluments": [
+        r"Emolumentos",
+    ],
+    "ana_fee": [
+        r"Taxa\s+A\.?N\.?A\.?",
+    ],
+    "operational_fee": [
+        r"Taxa\s+Operacional",
+    ],
+    "execution_fee": [
+        r"^Execu[cç][aã]o$",
+    ],
+    "custody_fee": [
+        r"Taxa\s+de\s+Cust[oó]dia",
+    ],
+    "taxes": [
+        r"^Impostos$",
+        r"^ISS(?:\s*\([^)]*\))?$",
+    ],
+    "other_fee": [
+        r"^Outras$",
+        r"Outras\s+Bovespa",
+    ],
+    "irrf": [
+        r"I\.?R\.?R\.?F",
+    ],
+}
+
+# Rótulos usados para validação matemática; nunca entram no rateio.
+TOTAL_LABEL_PATTERNS = {
+    "net_operations":    r"Valor\s+l[ií]quido\s+das\s+opera[cç][õo]es",
+    "total_cblc":        r"Total\s+CBLC",
+    "total_bovespa":     r"Total\s+Bovespa\s*/\s*Soma|Total\s+Bolsa",
+    "total_depositaria": r"Total\s+Deposit[aá]ria",
+    "total_costs":       r"Total\s+Corretagem|Total\s+Custos",
+    "liquido_para":      r"L[ií]quido\s+para",
+}
+
+
+###############################################################################
+# FUNÇÕES AUXILIARES GERAIS
 ###############################################################################
 
 class PdfPasswordRequiredError(RuntimeError):
@@ -235,7 +279,7 @@ def _extract_cpf_from_pdf(pdf_path: str, password: Optional[str] = None) -> Opti
 
 
 ###############################################################################
-# DETECÇÃO DE TIPO DE ATIVO
+# DETECÇÃO DE TIPO DE ATIVO GERAL
 ###############################################################################
 
 def detect_asset_type(name: str, ticker: Optional[str]) -> Optional[str]:
@@ -247,8 +291,8 @@ def detect_asset_type(name: str, ticker: Optional[str]) -> Optional[str]:
     1. ETF           (lista fixa de 112 tickers)
     2. FII / FIAGRO  (ticker termina em 11 + palavra-chave no nome)
     3. BDR / DRN     (ticker termina em 33/34, ou "BDR"/"DRN" no nome)
-    4. UNITS         (ticker termina em 11 sem ser FII/FIAGRO, ou "UNIT"/"UNT"/"UN" no nome)
-    5. ON            (palavra "ON" no nome, sem ser UNIT)
+    4. UNITS         (lista fixa de 13 tickers)
+    5. ON            (palavra "ON" no nome)
     6. PN            (palavra "PN" no nome)
 
     Retorna o identificador canônico (ON, PN, FII, FIAGRO, BDR, UNITS, ETF)
@@ -280,13 +324,8 @@ def detect_asset_type(name: str, ticker: Optional[str]) -> Optional[str]:
         return ASSET_TYPE_BDR
 
     # ── 4. UNITS ─────────────────────────────────────────────────────────────
-    # UNITS são identificadas:
-    #   a) Pela lista de UNITS conhecidos por ticker (13 tickers listados)
-    #   b) Pelo texto "UNIT", "UNT" ou " UN " no nome da ação
-    # O espaço em torno de "UN" é importante para não confundir com palavras como "UNI" ou "FUND".
+    # Verifica a lista de UNITS conhecidos.
     if ticker_upper in UNITS_TICKERS_CONHECIDOS:
-        return ASSET_TYPE_UNITS
-    if re.search(r"\bUNIT\b|\bUNT\b|\bUN\b", name_upper):
         return ASSET_TYPE_UNITS
 
     # ── 5. ON (Ordinária) ────────────────────────────────────────────────────
@@ -308,10 +347,24 @@ def detect_asset_type(name: str, ticker: Optional[str]) -> Optional[str]:
     return None
 
 
-###############################################################################
-# CAMADA 2: Parser próprio com pdfplumber para layouts não-CorrePy
-###############################################################################
+def normalize_b3_ticker(ticker: Optional[str]) -> Optional[str]:
+    """Normaliza ticker B3 removendo o F final de mercado fracionário.
 
+    Ex.: BBAS3F e KBLN11F representam o mesmo ativo negociado à vista como
+    BBAS3 e KBLN11. A remoção só acontece quando o ticker segue o padrão de
+    ativo B3 com 4 letras, 1 ou 2 dígitos e F no final.
+    """
+    if ticker is None:
+        return None
+    ticker_upper = str(ticker).strip().upper()
+    if not ticker_upper:
+        return None
+    if re.fullmatch(r"[A-Z]{4}\d{1,2}F", ticker_upper):
+        return ticker_upper[:-1]
+    return ticker_upper
+
+
+# Função auxiliar do orquestrador: identifica corretora para escolher parser específico.
 def _detect_broker(text: str) -> str:
     """Identifica a corretora pelo CNPJ ou nome presente no texto do PDF.
 
@@ -329,7 +382,7 @@ def _detect_broker(text: str) -> str:
         return "inter"
     return "unknown"
 
-
+# Função auxiliar dos parsers: extrai texto bruto do PDF com PyMuPDF.
 def _extract_text_from_pdf(pdf_path: str, password: Optional[str] = None) -> str:
     """Extrai texto bruto de todas as páginas do PDF usando PyMuPDF.
 
@@ -353,7 +406,7 @@ def _extract_text_from_pdf(pdf_path: str, password: Optional[str] = None) -> str
     except Exception as exc:
         raise RuntimeError(f"Não foi possível extrair texto do PDF: {exc}") from exc
 
-
+# Função auxiliar dos parsers: extrai CPF do texto bruto da nota.
 def _extract_cpf_from_text(text: str) -> Optional[str]:
     """Extrai o primeiro CPF encontrado em um texto bruto."""
     match = re.search(r"\b(\d{3}[\.\s]?\d{3}[\.\s]?\d{3}[\-\s]?\d{2})\b", text or "")
@@ -362,7 +415,7 @@ def _extract_cpf_from_text(text: str) -> Optional[str]:
     cpf = re.sub(r"\D", "", match.group(1))
     return cpf if len(cpf) == 11 else None
 
-
+# Função auxiliar dos parsers: extrai a data de pregão do texto bruto.
 def _extract_ref_date_from_text(text: str) -> date:
     """Tenta localizar a data do pregão no texto bruto da nota.
 
@@ -384,7 +437,7 @@ def _extract_ref_date_from_text(text: str) -> date:
 
     raise RuntimeError("Não foi possível localizar a data do pregão no texto da nota.")
 
-
+# Função auxiliar do orquestrador: valida mês/ano e CPF das linhas extraídas.
 def _validate_rows_against_month_cpf(
     rows: List[dict],
     filename: str,
@@ -411,379 +464,74 @@ def _validate_rows_against_month_cpf(
                     f"diferente do CPF informado {formatar_cpf(expected_cpf_digits)}."
                 )
 
+# Função auxiliar do orquestrador: confirma se as linhas têm operações utilizáveis.
+def _rows_have_valid_operations(rows: List[dict]) -> bool:
+    """Retorna True se as linhas extraídas têm operação com quantidade, preço e total utilizáveis."""
 
-def _parse_generic_text_bovespa(pdf_path: str, password: Optional[str] = None) -> List[dict]:
-    """Parser genérico para notas Bovespa à vista quando CorrePy e parser específico falham.
+    for row in rows:
+        amount = row.get("amount")
+        unit_price = row.get("unit_price")
+        total_value = row.get("total_value")
+        if amount is not None and amount > 0 and unit_price is not None and unit_price > 0:
+            if total_value is None or total_value <= 0:
+                total_value = amount * unit_price
+            if total_value > 0:
+                return True
+    return False
 
-    Estratégia:
-    - extrai texto bruto com PyMuPDF;
-    - procura linhas com C/V;
-    - identifica quantidade, preço unitário, valor total e D/C pelo fim da linha;
-    - tenta localizar ticker por padrão brasileiro (ex.: PETR4, HGLG11);
-    - se não localizar ticker, deixa None para a sua janela `_pedir_ticker` resolver depois.
+# Função auxiliar da Camada 1: valida se o CorrePy trouxe transações utilizáveis.
+def _correpy_notes_have_valid_transactions(notes: List) -> bool:
+    """Retorna True se o CorrePy extraiu ao menos uma transação utilizável."""
 
-    Limitação intencional:
-    - Este parser é voltado para operações à vista/fracionário de B3.
-    - Futuros/BMF/WIN/WDO devem ter parser próprio, pois o cálculo tributário é diferente.
-    """
-    filename = os.path.basename(pdf_path)
-    text = _extract_text_from_pdf(pdf_path, password=password)
-
-    ref_date = _extract_ref_date_from_text(text)
-    cpf_digits = _extract_cpf_from_text(text)
-
-    lines = [
-        re.sub(r"\s+", " ", raw_line).strip()
-        for raw_line in text.splitlines()
-        if raw_line and raw_line.strip()
-    ]
-
-    settlement_fee   = _extract_fee_from_label_line(text, r"Taxa\s+de\s+Liquidaçã?o|Taxa\s+de\s+Liquidação\s*/\s*CCP")
-    registration_fee = _extract_fee_from_label_line(text, r"Taxa\s+de\s+Registro")
-    transfer_fee     = _extract_fee_from_label_line(text, r"Taxa\s+de\s+(?:Transfer[eê]ncia|Transf\.?)\s+de\s+Ativos")
-    ana_fee          = _extract_fee_from_label_line(text, r"Taxa\s+A\.?N\.?A\.?")
-    emoluments       = _extract_fee_from_label_line(text, r"Emolumentos")
-    other_fee        = _extract_fee_from_label_line(text, r"Outr[ao]s(?:\s+Bovespa)?")
-    irrf_note        = _extract_fee_from_label_line(text, r"I\.?R\.?R\.?F\.?|IRRF")
-
-    if settlement_fee == 0:
-        settlement_fee = _extract_fee_near_label(lines, r"Taxa\s+de\s+Liquidaçã?o|Taxa\s+de\s+Liquidação\s*/\s*CCP")
-    if registration_fee == 0:
-        registration_fee = _extract_fee_near_label(lines, r"Taxa\s+de\s+Registro")
-    if transfer_fee == 0:
-        transfer_fee = _extract_fee_near_label(lines, r"Taxa\s+de\s+(?:Transfer[eê]ncia|Transf\.?)\s+de\s+Ativos")
-    if ana_fee == 0:
-        ana_fee = _extract_fee_near_label(lines, r"Taxa\s+A\.?N\.?A\.?")
-    if emoluments == 0:
-        emoluments = _extract_fee_near_label(lines, r"Emolumentos")
-    if irrf_note == 0:
-        irrf_note = _extract_fee_near_label(lines, r"I\.?R\.?R\.?F\.?|IRRF")
-
-    money = r"(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2,6}"
-    qty   = r"\d{1,12}(?:\.\d{3})*"
-
-    # Captura o fim da linha:
-    # ... QTD PRECO VALOR D/C
-    end_pattern = re.compile(
-        rf"(?P<before>.+?)\s+(?P<amount>{qty})\s+(?P<unit>{money})\s+(?P<total>{money})\s+(?P<dc>[DC])(?:\s|$)",
-        re.IGNORECASE,
-    )
-
-    rows: List[dict] = []
-
-    for raw_line in text.splitlines():
-        line = re.sub(r"\s+", " ", raw_line).strip()
-        if not line:
-            continue
-
-        line_upper = line.upper()
-
-        # Ignora linhas de resumo/rodapé.
-        if any(x in line_upper for x in ("SUBTOTAL", "RESUMO", "TOTAL", "LIQUIDO", "LÍQUIDO")):
-            continue
-
-        # Só tenta linhas com indicação operacional e mercado Bovespa/B3.
-        if not re.search(r"\b[CV]\b", line_upper):
-            continue
-        if not re.search(r"BOVESPA|B3|VISTA|VIS|FRACION", line_upper):
-            continue
-
-        # Evita tentar interpretar futuros/BMF no parser genérico de ações.
-        if re.search(r"\b(WIN|WDO|IND|DOL)\b|BM&F|BMF|FUTURO", line_upper):
-            continue
-
-        match = end_pattern.search(line_upper)
-        if not match:
-            continue
-
-        before = match.group("before").strip()
-        tokens = before.split()
-
-        cv_idx = None
-        for i, token in enumerate(tokens):
-            if token in ("C", "V"):
-                cv_idx = i
-                break
-
-        if cv_idx is None:
-            continue
-
-        cv = tokens[cv_idx]
-        transaction_type = "buy" if cv == "C" else "sell"
-
-        # Normalmente, após C/V vem o tipo de mercado (VISTA/VIS/FRACIONARIO).
-        name_tokens = tokens[cv_idx + 2:] if len(tokens) > cv_idx + 2 else tokens[cv_idx + 1:]
-        name = " ".join(name_tokens).strip()
-
-        # Tenta localizar ticker brasileiro dentro da descrição.
-        ticker_match = re.search(r"\b[A-Z]{4}\d{1,2}[A-Z]?\b", name)
-        ticker = ticker_match.group(0) if ticker_match else None
-
-        amount = _parse_integer_br(match.group("amount"))
-        unit_price = _parse_decimal_br(match.group("unit"))
-        total_value = _parse_decimal_br(match.group("total"))
-
-        if amount is None or amount <= 0 or unit_price is None or unit_price <= 0:
-            continue
-
-        if total_value is None or total_value <= 0:
-            total_value = amount * unit_price
-
-        if not name:
-            name = ticker or "ATIVO NAO IDENTIFICADO"
-
-        rows.append({
-            "ref_date": ref_date,
-            "ticker": ticker,
-            "name": name,
-            "transaction_type": transaction_type,
-            "amount": amount,
-            "unit_price": unit_price,
-            "total_value": total_value,
-            "settlement_fee_note": settlement_fee,
-            "emoluments_note": emoluments,
-            "registration_fee_note": registration_fee,
-            "transfer_fee_note": transfer_fee,
-            "ana_fee_note": ana_fee,
-            "other_fee_note": other_fee,
-            "irrf": irrf_note,
-            "cpf": cpf_digits,
-        })
-
-    if not rows:
-        rows = _parse_vertical_operation_blocks(
-            lines=lines,
-            ref_date=ref_date,
-            cpf_digits=cpf_digits,
-            settlement_fee=settlement_fee,
-            registration_fee=registration_fee,
-            transfer_fee=transfer_fee,
-            ana_fee=ana_fee,
-            emoluments=emoluments,
-            other_fee=other_fee,
-            irrf_note=irrf_note,
-            start_mode="separate_cv",
-        )
-
-    if not rows:
-        raise RuntimeError(f"Parser genérico: nenhuma operação Bovespa encontrada em '{filename}'.")
-
-    return rows
+    for note in notes:
+        for tx in getattr(note, "transactions", []) or []:
+            amount = getattr(tx, "amount", None)
+            unit_price = getattr(tx, "unit_price", None)
+            total_value = getattr(tx, "total_value", None)
+            if amount is not None and amount > 0 and unit_price is not None and unit_price > 0:
+                if total_value is None or total_value <= 0:
+                    total_value = amount * unit_price
+                if total_value > 0:
+                    return True
+    return False
 
 
-def _parse_manual_review_lines(
-    grid_rows: List[Dict[str, str]],
-    taxas: Dict[str, Decimal],
-    cpf_digits: Optional[str] = None,
-) -> List[dict]:
-    """Converte as linhas da grade visual em linhas de operação.
-
-    Cada elemento de grid_rows é um dict com as chaves:
-        data, c/v, ticker, nome, quantidade, preco, total
-
-    Esses valores vêm dos campos Entry da tabela visual de _revisao_manual_nota().
-    O campo 'total' é opcional: se vazio ou zero, é calculado como quantidade x preço.
-    """
-    rows: List[dict] = []
-
-    for line_no, cell in enumerate(grid_rows, start=1):
-        # Ignora linhas completamente em branco
-        valores = [v.strip() for v in cell.values()]
-        if not any(v for v in valores[:6]):   # os 6 primeiros campos obrigatórios
-            continue
-
-        # ── Data ──────────────────────────────────────────────────────────────
-        data_str = cell.get("data", "").strip()
-        if not data_str:
-            raise RuntimeError(f"Linha {line_no}: campo 'Data' está vazio.")
-        try:
-            ref_date = _parse_date_br(data_str)
-        except Exception:
-            raise RuntimeError(
-                f"Linha {line_no}: data '{data_str}' inválida. Use DD/MM/AAAA."
-            )
-
-        # ── C/V ───────────────────────────────────────────────────────────────
-        cv = cell.get("cv", "").strip().upper()
-        if cv not in ("C", "V"):
-            raise RuntimeError(
-                f"Linha {line_no}: C/V deve ser exatamente 'C' (compra) ou 'V' (venda). "
-                f"Recebido: '{cv}'"
-            )
-
-        # ── Ticker ────────────────────────────────────────────────────────────
-        ticker = cell.get("ticker", "").strip().upper()
-        if not ticker or not re.fullmatch(r"[A-Z0-9]{4,12}", ticker):
-            raise RuntimeError(
-                f"Linha {line_no}: ticker '{ticker}' inválido. "
-                "Use 4 a 12 letras/números, ex.: PETR4, HGLG11."
-            )
-
-        # ── Nome ─────────────────────────────────────────────────────────────
-        name = cell.get("nome", "").strip().upper() or ticker
-
-        # ── Quantidade ───────────────────────────────────────────────────────
-        amount = _parse_integer_br(cell.get("quantidade", ""))
-        if amount is None or amount <= 0:
-            raise RuntimeError(
-                f"Linha {line_no}: quantidade '{cell.get('quantidade')}' inválida. "
-                "Use um número inteiro positivo, ex.: 100"
-            )
-
-        # ── Preço ─────────────────────────────────────────────────────────────
-        unit_price = _parse_decimal_br(cell.get("preco", ""))
-        if unit_price is None or unit_price <= 0:
-            raise RuntimeError(
-                f"Linha {line_no}: preço '{cell.get('preco')}' inválido. "
-                "Use vírgula como decimal, ex.: 28,50"
-            )
-
-        # ── Total (opcional) ──────────────────────────────────────────────────
-        total_str = cell.get("total", "").strip()
-        total_value = _parse_decimal_br(total_str) if total_str else None
-        if total_value is None or total_value <= 0:
-            total_value = amount * unit_price
-
-        rows.append({
-            "ref_date": ref_date,
-            "ticker": ticker,
-            "name": name,
-            "transaction_type": "buy" if cv == "C" else "sell",
-            "amount": amount,
-            "unit_price": unit_price,
-            "total_value": total_value,
-            "settlement_fee_note":  taxas.get("settlement_fee",  Decimal("0")),
-            "emoluments_note":      taxas.get("emoluments",      Decimal("0")),
-            "registration_fee_note": taxas.get("registration_fee", Decimal("0")),
-            "transfer_fee_note":    taxas.get("transfer_fee",    Decimal("0")),
-            "ana_fee_note":         taxas.get("ana_fee",         Decimal("0")),
-            "other_fee_note":       taxas.get("other_fee",       Decimal("0")),
-            "irrf":                 taxas.get("irrf",            Decimal("0")),
-            "cpf": cpf_digits,
-        })
-
-    if not rows:
-        raise RuntimeError(
-            "Nenhuma operação foi preenchida. "
-            "Preencha ao menos uma linha na tabela antes de confirmar."
-        )
-
-    return rows
+def _apply_financial_summary_to_rows(rows: List[dict], financial: FinancialSummary) -> None:
+    """Copia o Resumo Financeiro normalizado para as linhas brutas do parser."""
+    for row in rows:
+        row["settlement_fee_note"] = financial.settlement_fee
+        row["emoluments_note"] = financial.emoluments
+        row["registration_fee_note"] = financial.registration_fee
+        row["transfer_fee_note"] = financial.transfer_fee
+        row["ana_fee_note"] = financial.ana_fee
+        row["operational_fee_note"] = financial.operational_fee
+        row["execution_fee_note"] = financial.execution_fee
+        row["custody_fee_note"] = financial.custody_fee
+        row["taxes_note"] = financial.taxes
+        row["other_fee_note"] = financial.other_fee
+        row["irrf"] = financial.irrf
 
 
-def _parse_vertical_operation_blocks(
+def _extract_and_apply_financial_summary(
+    rows: List[dict],
     lines: List[str],
-    ref_date: date,
-    cpf_digits: Optional[str],
-    settlement_fee: Decimal,
-    registration_fee: Decimal,
-    transfer_fee: Decimal,
-    ana_fee: Decimal,
-    emoluments: Decimal,
-    other_fee: Decimal,
-    irrf_note: Decimal,
-    start_mode: str,
-) -> List[dict]:
-    """Lê operações em blocos verticais extraídos do PDF.
-
-    start_mode:
-    - "separate_cv": início em BOVESPA/B3, C/V na linha seguinte.
-    - "inline_cv"  : início com C/V na mesma linha, ex.: B3 RV LISTADO V.
-    """
-    money = r"(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2,6}"
-    qty = r"\d{1,12}(?:\.\d{3})*"
-    rows: List[dict] = []
-
-    i = 0
-    while i < len(lines):
-        line_upper = lines[i].upper()
-
-        if start_mode == "inline_cv":
-            start_match = re.search(r"\bB3\s+RV\s+LISTADO\s+([CV])\b", line_upper)
-            if not start_match:
-                i += 1
-                continue
-            cv = start_match.group(1)
-            market_idx = i + 1
-            name_idx = i + 2
-        else:
-            if not re.search(r"BOVESPA|B3", line_upper):
-                i += 1
-                continue
-            if i + 2 >= len(lines):
-                break
-            cv = lines[i + 1].strip().upper()
-            if cv not in ("C", "V"):
-                i += 1
-                continue
-            market_idx = i + 2
-            name_idx = i + 3
-
-        if market_idx >= len(lines) or not re.search(r"VISTA|VIS|FRACION", lines[market_idx], re.IGNORECASE):
-            i += 1
-            continue
-
-        name_parts: List[str] = []
-        j = name_idx
-        while j < len(lines):
-            candidate = lines[j].strip()
-            if re.fullmatch(qty, candidate):
-                break
-            if re.fullmatch(r"D[#\d]*", candidate.upper()):
-                j += 1
-                break
-            if re.search(r"RESUMO|TOTAL|LIQUIDO|LÍQUIDO", candidate, re.IGNORECASE):
-                break
-            name_parts.append(candidate)
-            j += 1
-
-        if (
-            not name_parts
-            or j + 3 >= len(lines)
-            or not re.fullmatch(qty, lines[j].strip())
-            or not re.fullmatch(money, lines[j + 1].strip())
-            or not re.fullmatch(money, lines[j + 2].strip())
-            or lines[j + 3].strip().upper() not in ("C", "D")
-        ):
-            i += 1
-            continue
-
-        amount = _parse_integer_br(lines[j])
-        unit_price = _parse_decimal_br(lines[j + 1])
-        total_value = _parse_decimal_br(lines[j + 2])
-        if amount is None or amount <= 0 or unit_price is None or unit_price <= 0:
-            i = j + 4
-            continue
-        if total_value is None or total_value <= 0:
-            total_value = amount * unit_price
-
-        name = " ".join(name_parts).strip()
-        ticker_match = re.search(r"\b[A-Z]{4}\d{1,2}[A-Z]?\b", name.upper())
-        ticker = ticker_match.group(0) if ticker_match else None
-
-        rows.append({
-            "ref_date": ref_date,
-            "ticker": ticker,
-            "name": name or ticker or "ATIVO NAO IDENTIFICADO",
-            "transaction_type": "buy" if cv == "C" else "sell",
-            "amount": amount,
-            "unit_price": unit_price,
-            "total_value": total_value,
-            "settlement_fee_note": settlement_fee,
-            "emoluments_note": emoluments,
-            "registration_fee_note": registration_fee,
-            "transfer_fee_note": transfer_fee,
-            "ana_fee_note": ana_fee,
-            "other_fee_note": other_fee,
-            "irrf": irrf_note,
-            "cpf": cpf_digits,
-        })
-        i = j + 4
-
-    return rows
+    broker: str,
+    warning_prefix: Optional[str] = None,
+) -> FinancialSummary:
+    """Extrai o Resumo Financeiro da nota e aplica o resultado às linhas lidas."""
+    total_value_note = sum(r["total_value"] for r in rows)
+    financial = extract_financial_summary(lines, operation_total=total_value_note, broker=broker)
+    _apply_financial_summary_to_rows(rows, financial)
+    if warning_prefix and financial.warnings:
+        print(f"{warning_prefix} {financial.warnings} — nota pode ter taxas incorretas")
+    return financial
 
 
+###############################################################################
+# CAMADA 2 — PARSERS ESPECÍFICOS POR CORRETORA (Inter, Genial)
+###############################################################################
 
+# Parser específico Inter: mantém a leitura de operações por tabela pdfplumber.
 def _parse_inter_pdfplumber(pdf_path: str, password: Optional[str] = None) -> List[dict]:
     """Parser específico para o layout de nota do Banco Inter (Inter DTVM Ltda.).
 
@@ -821,14 +569,13 @@ def _parse_inter_pdfplumber(pdf_path: str, password: Optional[str] = None) -> Li
     cpf_match = re.search(r"\b(\d{3}[\.\s]?\d{3}[\.\s]?\d{3}[\-\s]?\d{2})\b", full_text)
     cpf_digits = re.sub(r"\D", "", cpf_match.group(1)) if cpf_match else None
 
-    # Extrai taxas do Resumo Financeiro
-    settlement_fee   = _extract_fee_from_label_line(full_text, r"Taxa\s+de\s+Liquidaçã?o")
-    registration_fee = _extract_fee_from_label_line(full_text, r"Taxa\s+de\s+Registro\s*\(\d+\)\s*([\d.,]+)")
-    transfer_fee     = _extract_fee_from_label_line(full_text, r"Taxa\s+de\s+(?:Transfer[eê]ncia|Transf\.?)\s+de\s+Ativos\s+([\d.,]+)")
-    ana_fee          = _extract_fee_from_label_line(full_text, r"Taxa\s+A\.?N\.?A\.?")
-    emoluments       = _extract_fee_from_label_line(full_text, r"Emolumentos\s+([\d.,]+)")
-    other_fee        = _extract_fee_from_label_line(full_text, r"Outr[ao]s(?:\s+Bovespa)?")
-    irrf_note        = _extract_irrf_from_lines(lines)
+    settlement_fee = Decimal("0")
+    registration_fee = Decimal("0")
+    transfer_fee = Decimal("0")
+    ana_fee = Decimal("0")
+    emoluments = Decimal("0")
+    other_fee = Decimal("0")
+    irrf_note = Decimal("0")
 
     # Extrai operações da tabela
     operations: List[dict] = []
@@ -855,7 +602,7 @@ def _parse_inter_pdfplumber(pdf_path: str, password: Optional[str] = None) -> Li
                         continue
 
                     partes_spec = especificacao.split()
-                    ticker = partes_spec[0].upper() if partes_spec else None
+                    ticker = normalize_b3_ticker(partes_spec[0]) if partes_spec else None
                     name   = especificacao  # nome completo para detect_asset_type
 
                     amount     = _parse_integer_br(row_clean[5])
@@ -886,22 +633,12 @@ def _parse_inter_pdfplumber(pdf_path: str, password: Optional[str] = None) -> Li
     if not operations:
         raise RuntimeError("Parser Inter (pdfplumber): nenhuma operação encontrada na tabela da nota.")
 
+    _extract_and_apply_financial_summary(operations, lines, broker="inter")
+
     return operations
 
 
-def _extract_fee_from_vertical_lines(lines: List[str], label_pattern: str) -> Decimal:
-    """Extrai taxa quando o rótulo e o valor ficam em linhas separadas."""
-    for idx, line in enumerate(lines):
-        if not re.search(label_pattern, line, re.IGNORECASE):
-            continue
-        for candidate in lines[idx + 1:idx + 5]:
-            value = _parse_decimal_br(candidate)
-            if value is not None:
-                return value
-        continue
-    return Decimal("0")
-
-
+# Helper legado: extrai taxa próxima ao rótulo, usado pela taxa de transferência do CorrePy.
 def _extract_fee_near_label(lines: List[str], label_pattern: str) -> Decimal:
     """Extrai taxa em layouts verticais onde o valor pode vir antes ou depois do rótulo."""
     for idx, line in enumerate(lines):
@@ -926,6 +663,7 @@ def _extract_fee_near_label(lines: List[str], label_pattern: str) -> Decimal:
     return Decimal("0")
 
 
+# Helper da Camada 1: extrai taxa manual por data para complementar notas CorrePy.
 def _extract_fee_by_ref_date_from_pdf(
     pdf_path: str,
     password: Optional[str],
@@ -965,32 +703,7 @@ def _extract_fee_by_ref_date_from_pdf(
     return fees_by_date
 
 
-def _extract_irrf_from_lines(lines: List[str]) -> Decimal:
-    """Extrai IRRF, ignorando o valor da base de cálculo quando ele aparece na linha."""
-    for idx, line in enumerate(lines):
-        if not re.search(r"I\.?R\.?R\.?F\.?|IRRF", line, re.IGNORECASE):
-            continue
-
-        projection = re.search(r"Projeç[aã]o\s+R\$\s*([\d.,-]+)", line, re.IGNORECASE)
-        if projection:
-            value = _parse_decimal_br(projection.group(1))
-            return value if value is not None and value > 0 else Decimal("0")
-
-        if re.search(r"base\s+R\$", line, re.IGNORECASE):
-            for candidate in lines[idx + 1:idx + 5]:
-                value = _parse_decimal_br(candidate)
-                if value is not None and value >= 0:
-                    return value
-            return Decimal("0")
-
-        values = re.findall(r"-?\d{1,3}(?:\.\d{3})*,\d+|-?\d+,\d+", line)
-        if values:
-            value = _parse_decimal_br(values[-1])
-            return value if value is not None and value > 0 else Decimal("0")
-
-    return Decimal("0")
-
-
+# Parser específico Genial: mantém a leitura de operações em blocos verticais.
 def _parse_genial_pdfplumber(pdf_path: str, password: Optional[str] = None) -> List[dict]:
     """Parser específico para notas Genial com operações em blocos verticais."""
     rows: List[dict] = []
@@ -1015,27 +728,23 @@ def _parse_genial_pdfplumber(pdf_path: str, password: Optional[str] = None) -> L
             if raw_line and raw_line.strip()
         ]
 
-        settlement_fee   = _extract_fee_from_vertical_lines(lines, r"Taxa\s+de\s+liquidaçã?o")
-        registration_fee = _extract_fee_from_vertical_lines(lines, r"Taxa\s+de\s+Registro")
-        transfer_fee     = _extract_fee_from_vertical_lines(lines, r"Taxa\s+de\s+(?:Transfer[eê]ncia|Transf\.?)\s+de\s+Ativos")
-        ana_fee          = _extract_fee_from_vertical_lines(lines, r"Taxa\s+A\.?N\.?A\.?")
-        emoluments       = _extract_fee_from_vertical_lines(lines, r"Emolumentos")
-        other_fee        = _extract_fee_from_vertical_lines(lines, r"Outr[ao]s(?:\s+Bovespa)?")
-        irrf_note        = _extract_irrf_from_lines(lines)
-
-        rows.extend(_parse_vertical_operation_blocks(
+        page_rows = _parse_vertical_operation_blocks(
             lines=lines,
             ref_date=ref_date,
             cpf_digits=cpf_digits,
-            settlement_fee=settlement_fee,
-            registration_fee=registration_fee,
-            transfer_fee=transfer_fee,
-            ana_fee=ana_fee,
-            emoluments=emoluments,
-            other_fee=other_fee,
-            irrf_note=irrf_note,
+            settlement_fee=Decimal("0"),
+            registration_fee=Decimal("0"),
+            transfer_fee=Decimal("0"),
+            ana_fee=Decimal("0"),
+            emoluments=Decimal("0"),
+            other_fee=Decimal("0"),
+            irrf_note=Decimal("0"),
             start_mode="inline_cv",
-        ))
+        )
+
+        if page_rows:
+            _extract_and_apply_financial_summary(page_rows, lines, broker="genial")
+            rows.extend(page_rows)
 
     if not rows:
         raise RuntimeError("Parser Genial: nenhuma operação encontrada na nota.")
@@ -1089,6 +798,254 @@ def _parse_integer_br(value: str) -> Optional[Decimal]:
     if not v:
         return None
     return Decimal(v)
+
+
+def _money_values_from_line(line: str) -> List[Decimal]:
+    """Extrai todos os valores monetários de uma linha em formato brasileiro."""
+    money_pattern = r"-?\d{1,3}(?:\.\d{3})*,\d+|-?\d+,\d+"
+    values: List[Decimal] = []
+    for raw_value in re.findall(money_pattern, line or ""):
+        value = _parse_decimal_br(raw_value)
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def _last_money_from_line(line: str) -> Optional[Decimal]:
+    """Retorna o último valor monetário da linha, ignorando sufixos D/C."""
+    values = _money_values_from_line(line)
+    return values[-1] if values else None
+
+
+def _line_without_money_and_dc(line: str) -> str:
+    """Remove valores, R$ e D/C para comparar apenas o texto do rótulo."""
+    clean = re.sub(r"R\$", " ", line or "", flags=re.IGNORECASE)
+    clean = re.sub(r"-?\d{1,3}(?:\.\d{3})*,\d+|-?\d+,\d+", " ", clean)
+    clean = re.sub(r"\b[DC]\b", " ", clean, flags=re.IGNORECASE)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean
+
+
+def _label_matches(line: str, patterns: List[str]) -> bool:
+    """Confere se uma linha bate com algum padrão de rótulo financeiro."""
+    label_text = _line_without_money_and_dc(line)
+    return any(re.search(pattern, label_text, re.IGNORECASE) for pattern in patterns)
+
+
+def _financial_label_key(line: str) -> Optional[str]:
+    """Identifica o campo canônico de uma linha de rótulo financeiro."""
+    for field_name, patterns in FEE_LABEL_PATTERNS.items():
+        if _label_matches(line, patterns):
+            return field_name
+    for field_name, pattern in TOTAL_LABEL_PATTERNS.items():
+        if _label_matches(line, [pattern]):
+            return field_name
+    return None
+
+
+def _is_value_only_line(line: str) -> bool:
+    """Retorna True quando a linha contém somente um valor monetário e D/C opcional."""
+    return bool(re.fullmatch(
+        r"\s*(?:R\$)?\s*-?(?:\d{1,3}(?:\.\d{3})*|\d+),\d+\s*(?:[DC])?\s*",
+        line or "",
+        flags=re.IGNORECASE,
+    ))
+
+
+def _set_summary_field(summary: FinancialSummary, field_name: str, value: Decimal) -> None:
+    """Preenche um campo de FinancialSummary somando quando o rótulo se repetir."""
+    current = getattr(summary, field_name, Decimal("0"))
+    setattr(summary, field_name, current + value)
+
+
+def _try_fees_same_line(lines: List[str]) -> FinancialSummary:
+    """Estratégia A: extrai taxas quando valor e rótulo aparecem na mesma linha."""
+    summary = FinancialSummary(source="inline")
+    seen_fee_lines = set()
+
+    for idx, line in enumerate(lines):
+        for field_name, patterns in FEE_LABEL_PATTERNS.items():
+            if not _label_matches(line, patterns):
+                continue
+            if field_name == "irrf" and re.search(r"base\s+R\$", line, re.IGNORECASE):
+                projection = re.search(r"Projeç[aã]o\s+R\$\s*([\d.,-]+)", line, re.IGNORECASE)
+                if projection:
+                    value = _parse_decimal_br(projection.group(1))
+                else:
+                    values = _money_values_from_line(line)
+                    if len(values) <= 1:
+                        continue
+                    else:
+                        value = values[-1]
+                if value is None or value < 0:
+                    continue
+                _set_summary_field(summary, field_name, value)
+                continue
+            value = _last_money_from_line(line)
+            if value is None or value < 0:
+                continue
+            normalized_line = re.sub(r"\s+", " ", line).strip().lower()
+            seen_key = (field_name, value, normalized_line)
+            if seen_key in seen_fee_lines:
+                continue
+            seen_fee_lines.add(seen_key)
+            _set_summary_field(summary, field_name, value)
+
+    return summary
+
+
+def _try_fees_positional(lines: List[str], operation_total: Optional[Decimal] = None) -> FinancialSummary:
+    """Estratégia B: associa rótulos e valores por posição dentro do Resumo Financeiro."""
+    for idx, line in enumerate(lines):
+        if _label_matches(line, FEE_LABEL_PATTERNS["settlement_fee"]):
+            if _next_valid_value_line(lines, idx) is not None:
+                return FinancialSummary(source="positional", warnings=["next_line_layout_detected"])
+
+    start_idx = None
+    end_idx = None
+
+    for idx, line in enumerate(lines):
+        if start_idx is None and _label_matches(line, [TOTAL_LABEL_PATTERNS["net_operations"]]):
+            start_idx = idx
+            continue
+        if start_idx is not None and _label_matches(line, [TOTAL_LABEL_PATTERNS["liquido_para"]]):
+            end_idx = idx
+            break
+
+    if start_idx is None:
+        return FinancialSummary(source="positional", warnings=["financial_block_not_found"])
+
+    block = lines[start_idx:end_idx] if end_idx is not None else lines[start_idx:]
+    labels: List[str] = []
+    values: List[Decimal] = []
+
+    for line in block:
+        label_key = _financial_label_key(line)
+        if label_key is not None:
+            labels.append(label_key)
+        if _is_value_only_line(line):
+            value = _last_money_from_line(line)
+            if value is not None:
+                values.append(value)
+
+    mapped: Dict[str, Decimal] = {}
+
+    if operation_total is not None:
+        zero_fee_candidate: Optional[FinancialSummary] = None
+        for offset, value in enumerate(values):
+            if abs(value - operation_total) > Decimal("0.05"):
+                continue
+            if offset + 2 >= len(values):
+                continue
+            settlement_candidate = values[offset + 1]
+            registration_candidate = values[offset + 2]
+            expected_cblc = value + settlement_candidate + registration_candidate
+            total_cblc_found = any(
+                abs(candidate - expected_cblc) <= Decimal("0.05")
+                for candidate in values[offset + 3:]
+            )
+            if not total_cblc_found:
+                continue
+
+            summary = FinancialSummary(
+                settlement_fee=settlement_candidate,
+                registration_fee=registration_candidate,
+                source="positional",
+            )
+            summary.irrf = _try_fees_next_line(lines).irrf
+            if summary.has_any_fee():
+                return summary
+            if zero_fee_candidate is None:
+                zero_fee_candidate = summary
+        if zero_fee_candidate is not None:
+            return zero_fee_candidate
+
+    for label_key, value in zip(labels, values):
+        if label_key in mapped and not label_key.startswith("total_"):
+            mapped[label_key] += value
+        else:
+            mapped[label_key] = value
+
+    net_operations = mapped.get("net_operations")
+    total_cblc = mapped.get("total_cblc")
+    settlement_fee = mapped.get("settlement_fee", Decimal("0"))
+    registration_fee = mapped.get("registration_fee", Decimal("0"))
+
+    if net_operations is None or total_cblc is None:
+        return FinancialSummary(source="positional", warnings=["cblc_validation_failed"])
+
+    expected_cblc = net_operations + settlement_fee + registration_fee
+    if abs(expected_cblc - total_cblc) > Decimal("0.05"):
+        return FinancialSummary(source="positional", warnings=["cblc_validation_failed"])
+
+    summary = FinancialSummary(source="positional")
+    for field_name in FEE_LABEL_PATTERNS:
+        value = mapped.get(field_name)
+        if value is not None and value >= 0:
+            setattr(summary, field_name, value)
+
+    if summary.irrf == 0:
+        summary.irrf = _try_fees_next_line(lines).irrf
+
+    return summary
+
+
+def _next_valid_value_line(lines: List[str], start_idx: int) -> Optional[Decimal]:
+    """
+    Retorna o valor monetário da PRÓXIMA linha imediatamente válida após start_idx.
+    Uma linha válida é: não vazia, não contém apenas 'D' ou 'C', e contém um número monetário.
+    Olha APENAS A PRÓXIMA linha não-vazia — não olha 2 linhas à frente nem para trás.
+    Se a próxima linha válida não contiver número monetário, retorna None.
+    """
+    for candidate in lines[start_idx + 1:]:
+        candidate = (candidate or "").strip()
+        if not candidate:
+            continue
+        if re.fullmatch(r"[DC]", candidate, flags=re.IGNORECASE):
+            continue
+        return _last_money_from_line(candidate)
+    return None
+
+
+def _try_fees_next_line(lines: List[str]) -> FinancialSummary:
+    """Estratégia C: extrai taxas quando o valor está na próxima linha válida do rótulo."""
+    summary = FinancialSummary(source="next_line")
+
+    for idx, line in enumerate(lines):
+        for field_name, patterns in FEE_LABEL_PATTERNS.items():
+            if not _label_matches(line, patterns):
+                continue
+            value = _next_valid_value_line(lines, idx)
+            if value is None or value < 0:
+                continue
+            _set_summary_field(summary, field_name, value)
+
+    return summary
+
+
+def extract_financial_summary(
+    lines: List[str],
+    operation_total: Optional[Decimal] = None,
+    broker: Optional[str] = None,
+) -> FinancialSummary:
+    """Extrai o Resumo Financeiro SINACOR usando estratégias em cascata."""
+    inline = _try_fees_same_line(lines)
+    if inline.has_any_fee():
+        if inline.irrf == 0:
+            inline_irrf = _try_fees_next_line(lines).irrf
+            if inline_irrf > 0:
+                inline.irrf = inline_irrf
+        return inline
+
+    positional = _try_fees_positional(lines, operation_total=operation_total)
+    if positional.has_any_fee() and "cblc_validation_failed" not in positional.warnings:
+        return positional
+
+    next_line = _try_fees_next_line(lines)
+    if next_line.has_any_fee():
+        return next_line
+
+    return FinancialSummary(source="none", warnings=["no_fees_extracted"])
 
 
 def _recover_amount_from_extracted_text(
@@ -1157,7 +1114,7 @@ def _build_operations_from_pdfplumber_rows(
         return []
 
     operations: List[Operation] = []
-    groups: Dict[Tuple[date, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal], List[dict]] = {}
+    groups: Dict[Tuple[date, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal, Decimal], List[dict]] = {}
     for r in rows:
         key = (
             r["ref_date"],
@@ -1166,6 +1123,10 @@ def _build_operations_from_pdfplumber_rows(
             r.get("registration_fee_note", Decimal("0")),
             r.get("transfer_fee_note", Decimal("0")),
             r.get("ana_fee_note", Decimal("0")),
+            r.get("operational_fee_note", Decimal("0")),
+            r.get("execution_fee_note", Decimal("0")),
+            r.get("custody_fee_note", Decimal("0")),
+            r.get("taxes_note", Decimal("0")),
             r.get("other_fee_note", Decimal("0")),
             r.get("irrf", Decimal("0")),
         )
@@ -1178,6 +1139,10 @@ def _build_operations_from_pdfplumber_rows(
         registration_fee,
         transfer_fee,
         ana_fee,
+        operational_fee,
+        execution_fee,
+        custody_fee,
+        taxes,
         other_fee,
         irrf_note,
     ), group_rows in groups.items():
@@ -1189,13 +1154,14 @@ def _build_operations_from_pdfplumber_rows(
 
         total_fees = (
             settlement_fee + registration_fee + ana_fee
-            + emoluments + transfer_fee + other_fee
+            + emoluments + transfer_fee + operational_fee
+            + execution_fee + custody_fee + taxes + other_fee
         )
         for r in group_rows:
             proportion = r["total_value"] / total_value_note
             operations.append(Operation(
                 ref_date=r["ref_date"],
-                ticker=r["ticker"],
+                ticker=normalize_b3_ticker(r["ticker"]),
                 name=r["name"],
                 transaction_type=r["transaction_type"],
                 amount=r["amount"],
@@ -1210,11 +1176,459 @@ def _build_operations_from_pdfplumber_rows(
 
     return operations
 
+###############################################################################
+# CAMADA 3 — PARSER GENÉRICO SINACOR (fallback para corretoras não mapeadas)
+###############################################################################
+
+# Parser genérico tabular: lê operações SINACOR quando a linha sai completa no texto.
+def _parse_generic_text_bovespa(pdf_path: str, password: Optional[str] = None) -> List[dict]:
+    """Parser genérico para notas Bovespa à vista quando CorrePy e parser específico falham.
+
+    Estratégia:
+    - extrai texto bruto com PyMuPDF;
+    - procura linhas com C/V;
+    - identifica quantidade, preço unitário, valor total e D/C pelo fim da linha;
+    - tenta localizar ticker por padrão brasileiro (ex.: PETR4, HGLG11);
+    - se não localizar ticker, deixa None para a sua janela `_pedir_ticker` resolver depois.
+
+    Limitação intencional:
+    - Este parser é voltado para operações à vista/fracionário de B3.
+    - Futuros/BMF/WIN/WDO devem ter parser próprio, pois o cálculo tributário é diferente.
+    """
+    filename = os.path.basename(pdf_path)
+    text = _extract_text_from_pdf(pdf_path, password=password)
+
+    ref_date = _extract_ref_date_from_text(text)
+    cpf_digits = _extract_cpf_from_text(text)
+
+    lines = [
+        re.sub(r"\s+", " ", raw_line).strip()
+        for raw_line in text.splitlines()
+        if raw_line and raw_line.strip()
+    ]
+
+    settlement_fee = Decimal("0")
+    registration_fee = Decimal("0")
+    transfer_fee = Decimal("0")
+    ana_fee = Decimal("0")
+    emoluments = Decimal("0")
+    other_fee = Decimal("0")
+    irrf_note = Decimal("0")
+
+    money = r"(?:R\$\s*)?(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2,6}"
+    qty   = r"\d{1,12}(?:\.\d{3})*"
+
+    # Captura o fim da linha:
+    # ... QTD PRECO VALOR D/C
+    end_pattern = re.compile(
+        rf"(?P<before>.+?)\s+(?P<amount>{qty})\s+(?P<unit>{money})\s+(?P<total>{money})\s+(?P<dc>[DC])(?:\s|$)",
+        re.IGNORECASE,
+    )
+
+    rows: List[dict] = []
+
+    for raw_line in text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+
+        line_upper = line.upper()
+
+        # Ignora linhas de resumo/rodapé.
+        if any(x in line_upper for x in ("SUBTOTAL", "RESUMO", "TOTAL", "LIQUIDO", "LÍQUIDO")):
+            continue
+
+        # Só tenta linhas com indicação operacional e mercado Bovespa/B3.
+        if not re.search(r"\b[CV]\b", line_upper):
+            continue
+        if not re.search(r"BOVESPA|B3|VISTA|VIS|FRACION", line_upper):
+            continue
+
+        # Evita tentar interpretar futuros/BMF no parser genérico de ações.
+        if re.search(r"\b(WIN|WDO|IND|DOL)\b|BM&F|BMF|FUTURO", line_upper):
+            continue
+
+        match = end_pattern.search(line_upper)
+        if not match:
+            continue
+
+        before = match.group("before").strip()
+        tokens = before.split()
+
+        cv_idx = None
+        for i, token in enumerate(tokens):
+            if token in ("C", "V"):
+                cv_idx = i
+                break
+
+        if cv_idx is None:
+            continue
+
+        cv = tokens[cv_idx]
+        transaction_type = "buy" if cv == "C" else "sell"
+
+        # Normalmente, após C/V vem o tipo de mercado (VISTA/VIS/FRACIONARIO).
+        name_tokens = tokens[cv_idx + 2:] if len(tokens) > cv_idx + 2 else tokens[cv_idx + 1:]
+        name = " ".join(name_tokens).strip()
+
+        # Tenta localizar ticker brasileiro dentro da descrição.
+        ticker_match = re.search(r"\b[A-Z]{4}\d{1,2}[A-Z]?\b", name)
+        ticker = normalize_b3_ticker(ticker_match.group(0)) if ticker_match else None
+
+        amount = _parse_integer_br(match.group("amount"))
+        unit_price = _parse_decimal_br(match.group("unit"))
+        total_value = _parse_decimal_br(match.group("total"))
+
+        if amount is None or amount <= 0 or unit_price is None or unit_price <= 0:
+            continue
+
+        if total_value is None or total_value <= 0:
+            total_value = amount * unit_price
+
+        if not name:
+            name = ticker or "ATIVO NAO IDENTIFICADO"
+
+        rows.append({
+            "ref_date": ref_date,
+            "ticker": ticker,
+            "name": name,
+            "transaction_type": transaction_type,
+            "amount": amount,
+            "unit_price": unit_price,
+            "total_value": total_value,
+            "settlement_fee_note": settlement_fee,
+            "emoluments_note": emoluments,
+            "registration_fee_note": registration_fee,
+            "transfer_fee_note": transfer_fee,
+            "ana_fee_note": ana_fee,
+            "other_fee_note": other_fee,
+            "irrf": irrf_note,
+            "cpf": cpf_digits,
+        })
+
+    if not rows:
+        raise RuntimeError(f"Parser genérico tabular: nenhuma operação Bovespa encontrada em '{filename}'.")
+
+    broker = _detect_broker(text)
+    _extract_and_apply_financial_summary(
+        rows,
+        lines,
+        broker=broker,
+        warning_prefix="[AVISO parser genérico]",
+    )
+
+    return rows
+
+
+# Parser genérico vertical: lê operações quando as colunas do PDF saem empilhadas.
+def _parse_generic_vertical_bovespa(pdf_path: str, password: Optional[str] = None) -> List[dict]:
+    """Parser genérico vertical para notas em que as colunas saem como linhas separadas."""
+
+    filename = os.path.basename(pdf_path)
+    text = _extract_text_from_pdf(pdf_path, password=password)
+    ref_date = _extract_ref_date_from_text(text)
+    cpf_digits = _extract_cpf_from_text(text)
+
+    lines = [
+        re.sub(r"\s+", " ", raw_line).strip()
+        for raw_line in text.splitlines()
+        if raw_line and raw_line.strip()
+    ]
+
+    settlement_fee = Decimal("0")
+    registration_fee = Decimal("0")
+    transfer_fee = Decimal("0")
+    ana_fee = Decimal("0")
+    emoluments = Decimal("0")
+    other_fee = Decimal("0")
+    irrf_note = Decimal("0")
+
+    rows: List[dict] = []
+    for start_mode in ("separate_cv", "leading_cv"):
+        rows.extend(_parse_vertical_operation_blocks(
+            lines=lines,
+            ref_date=ref_date,
+            cpf_digits=cpf_digits,
+            settlement_fee=settlement_fee,
+            registration_fee=registration_fee,
+            transfer_fee=transfer_fee,
+            ana_fee=ana_fee,
+            emoluments=emoluments,
+            other_fee=other_fee,
+            irrf_note=irrf_note,
+            start_mode=start_mode,
+        ))
+
+    if not rows:
+        raise RuntimeError(f"Parser genérico vertical: nenhuma operação Bovespa encontrada em '{filename}'.")
+
+    broker = _detect_broker(text)
+    _extract_and_apply_financial_summary(
+        rows,
+        lines,
+        broker=broker,
+        warning_prefix="[AVISO parser genérico]",
+    )
+
+    return rows
+
+
+# Função comum dos parsers verticais: converte blocos de texto em linhas de operação.
+def _parse_vertical_operation_blocks(
+    lines: List[str],
+    ref_date: date,
+    cpf_digits: Optional[str],
+    settlement_fee: Decimal,
+    registration_fee: Decimal,
+    transfer_fee: Decimal,
+    ana_fee: Decimal,
+    emoluments: Decimal,
+    other_fee: Decimal,
+    irrf_note: Decimal,
+    start_mode: str,
+) -> List[dict]:
+    """Lê operações em blocos verticais extraídos do PDF.
+
+    start_mode:
+    - "separate_cv": início em BOVESPA/B3, C/V na linha seguinte.
+    - "inline_cv"  : início com C/V na mesma linha, ex.: B3 RV LISTADO V.
+    - "leading_cv" : início com C/V em uma linha e B3 na linha seguinte.
+    """
+    money = r"(?:R\$\s*)?(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2,6}"
+    money_with_optional_dc = rf"{money}(?:\s*[DC])?"
+    qty = r"\d{1,12}(?:\.\d{3})*"
+    rows: List[dict] = []
+
+    i = 0
+    while i < len(lines):
+        line_upper = lines[i].upper()
+
+        if start_mode == "inline_cv":
+            start_match = re.search(r"\bB3\s+RV\s+LISTADO\s+([CV])\b", line_upper)
+            if not start_match:
+                i += 1
+                continue
+            cv = start_match.group(1)
+            market_idx = i + 1
+            name_idx = i + 2
+        elif start_mode == "leading_cv":
+            cv = lines[i].strip().upper()
+            if cv not in ("C", "V"):
+                i += 1
+                continue
+
+            b3_idx = None
+            for candidate_idx in range(i + 1, min(i + 6, len(lines))):
+                if re.search(r"BOVESPA|B3", lines[candidate_idx], re.IGNORECASE):
+                    b3_idx = candidate_idx
+                    break
+            if b3_idx is None or b3_idx + 2 >= len(lines):
+                i += 1
+                continue
+
+            market_idx = b3_idx + 1
+            name_idx = b3_idx + 2
+        else:
+            if not re.search(r"BOVESPA|B3", line_upper):
+                i += 1
+                continue
+            if i + 2 >= len(lines):
+                break
+            cv = lines[i + 1].strip().upper()
+            if cv not in ("C", "V"):
+                i += 1
+                continue
+            market_idx = i + 2
+            name_idx = i + 3
+
+        if market_idx >= len(lines) or not re.search(r"VISTA|VIS|FRACION", lines[market_idx], re.IGNORECASE):
+            i += 1
+            continue
+
+        name_parts: List[str] = []
+        j = name_idx
+        while j < len(lines):
+            candidate = lines[j].strip()
+            if candidate in ("@", "@#"):
+                j += 1
+                continue
+            if re.fullmatch(qty, candidate):
+                break
+            if re.fullmatch(r"D[#\d]*", candidate.upper()):
+                j += 1
+                break
+            if re.search(r"RESUMO|TOTAL|LIQUIDO|LÍQUIDO", candidate, re.IGNORECASE):
+                break
+            name_parts.append(candidate)
+            j += 1
+
+        if (
+            not name_parts
+            or j + 2 >= len(lines)
+            or not re.fullmatch(qty, lines[j].strip())
+            or not re.fullmatch(money, lines[j + 1].strip())
+            or not re.fullmatch(money_with_optional_dc, lines[j + 2].strip(), re.IGNORECASE)
+        ):
+            i += 1
+            continue
+
+        total_line = lines[j + 2].strip()
+        dc_idx = None
+        if re.search(r"\b[DC]$", total_line, re.IGNORECASE):
+            dc_idx = j + 2
+        else:
+            for candidate_idx in range(j + 3, min(j + 7, len(lines))):
+                if lines[candidate_idx].strip().upper() in ("C", "D"):
+                    dc_idx = candidate_idx
+                    break
+        if dc_idx is None:
+            i += 1
+            continue
+
+        amount = _parse_integer_br(lines[j])
+        unit_price = _parse_decimal_br(lines[j + 1])
+        total_value = _parse_decimal_br(lines[j + 2])
+        if amount is None or amount <= 0 or unit_price is None or unit_price <= 0:
+            i = j + 4
+            continue
+        if total_value is None or total_value <= 0:
+            total_value = amount * unit_price
+
+        name = " ".join(name_parts).strip()
+        ticker_match = re.search(r"\b[A-Z]{4}\d{1,2}[A-Z]?\b", name.upper())
+        ticker = normalize_b3_ticker(ticker_match.group(0)) if ticker_match else None
+
+        rows.append({
+            "ref_date": ref_date,
+            "ticker": ticker,
+            "name": name or ticker or "ATIVO NAO IDENTIFICADO",
+            "transaction_type": "buy" if cv == "C" else "sell",
+            "amount": amount,
+            "unit_price": unit_price,
+            "total_value": total_value,
+            "settlement_fee_note": settlement_fee,
+            "emoluments_note": emoluments,
+            "registration_fee_note": registration_fee,
+            "transfer_fee_note": transfer_fee,
+            "ana_fee_note": ana_fee,
+            "other_fee_note": other_fee,
+            "irrf": irrf_note,
+            "cpf": cpf_digits,
+        })
+        i = dc_idx + 1
+
+    return rows
+
 
 ###############################################################################
-# Leitura de nota com CASCATA DE PARSERS (Camada 1 → Camada 2)
+# CAMADA 4 — REVISÃO MANUAL ASSISTIDA (quando todos os parsers falham)
 ###############################################################################
 
+def _parse_manual_review_lines(
+    grid_rows: List[Dict[str, str]],
+    taxas: Dict[str, Decimal],
+    cpf_digits: Optional[str] = None,
+) -> List[dict]:
+    """Converte as linhas da grade visual em linhas de operação.
+
+    Cada elemento de grid_rows é um dict com as chaves:
+        data, c/v, ticker, nome, quantidade, preco, total
+
+    Esses valores vêm dos campos Entry da tabela visual de _revisao_manual_nota().
+    O campo 'total' é opcional: se vazio ou zero, é calculado como quantidade x preço.
+    """
+    rows: List[dict] = []
+
+    for line_no, cell in enumerate(grid_rows, start=1):
+        # Ignora linhas completamente em branco
+        valores = [v.strip() for v in cell.values()]
+        if not any(v for v in valores[:6]):   # os 6 primeiros campos obrigatórios
+            continue
+
+        # ── Data ──────────────────────────────────────────────────────────────
+        data_str = cell.get("data", "").strip()
+        if not data_str:
+            raise RuntimeError(f"Linha {line_no}: campo 'Data' está vazio.")
+        try:
+            ref_date = _parse_date_br(data_str)
+        except Exception:
+            raise RuntimeError(
+                f"Linha {line_no}: data '{data_str}' inválida. Use DD/MM/AAAA."
+            )
+
+        # ── C/V ───────────────────────────────────────────────────────────────
+        cv = cell.get("cv", "").strip().upper()
+        if cv not in ("C", "V"):
+            raise RuntimeError(
+                f"Linha {line_no}: C/V deve ser exatamente 'C' (compra) ou 'V' (venda). "
+                f"Recebido: '{cv}'"
+            )
+
+        # ── Ticker ────────────────────────────────────────────────────────────
+        ticker = normalize_b3_ticker(cell.get("ticker", "")) or ""
+        if not ticker or not re.fullmatch(r"[A-Z0-9]{4,12}", ticker):
+            raise RuntimeError(
+                f"Linha {line_no}: ticker '{ticker}' inválido. "
+                "Use 4 a 12 letras/números, ex.: PETR4, HGLG11."
+            )
+
+        # ── Nome ─────────────────────────────────────────────────────────────
+        name = cell.get("nome", "").strip().upper() or ticker
+
+        # ── Quantidade ───────────────────────────────────────────────────────
+        amount = _parse_integer_br(cell.get("quantidade", ""))
+        if amount is None or amount <= 0:
+            raise RuntimeError(
+                f"Linha {line_no}: quantidade '{cell.get('quantidade')}' inválida. "
+                "Use um número inteiro positivo, ex.: 100"
+            )
+
+        # ── Preço ─────────────────────────────────────────────────────────────
+        unit_price = _parse_decimal_br(cell.get("preco", ""))
+        if unit_price is None or unit_price <= 0:
+            raise RuntimeError(
+                f"Linha {line_no}: preço '{cell.get('preco')}' inválido. "
+                "Use vírgula como decimal, ex.: 28,50"
+            )
+
+        # ── Total (opcional) ──────────────────────────────────────────────────
+        total_str = cell.get("total", "").strip()
+        total_value = _parse_decimal_br(total_str) if total_str else None
+        if total_value is None or total_value <= 0:
+            total_value = amount * unit_price
+
+        rows.append({
+            "ref_date": ref_date,
+            "ticker": ticker,
+            "name": name,
+            "transaction_type": "buy" if cv == "C" else "sell",
+            "amount": amount,
+            "unit_price": unit_price,
+            "total_value": total_value,
+            "settlement_fee_note":  taxas.get("settlement_fee",  Decimal("0")),
+            "emoluments_note":      taxas.get("emoluments",      Decimal("0")),
+            "registration_fee_note": taxas.get("registration_fee", Decimal("0")),
+            "transfer_fee_note":    taxas.get("transfer_fee",    Decimal("0")),
+            "ana_fee_note":         taxas.get("ana_fee",         Decimal("0")),
+            "other_fee_note":       taxas.get("other_fee",       Decimal("0")),
+            "irrf":                 taxas.get("irrf",            Decimal("0")),
+            "cpf": cpf_digits,
+        })
+
+    if not rows:
+        raise RuntimeError(
+            "Nenhuma operação foi preenchida. "
+            "Preencha ao menos uma linha na tabela antes de confirmar."
+        )
+
+    return rows
+
+
+###############################################################################
+# ORQUESTRADOR (cascata de tentativas de parser)
+###############################################################################
+
+# Orquestrador principal: tenta CorrePy, parser específico, genérico e revisão manual.
 def read_brokerage_notes(
     pdf_path: str,
     expected_year: int,
@@ -1241,6 +1655,7 @@ def read_brokerage_notes(
     errors: List[str] = []
 
     # ── 1) CAMADA CORREPY ─────────────────────────────────────────────────────
+    correpy_validating = False
     try:
         with open(pdf_path, "rb") as f:
             content = io.BytesIO(f.read())
@@ -1252,14 +1667,12 @@ def read_brokerage_notes(
         if not notes:
             errors.append("CorrePy: retornou lista vazia.")
         else:
-            # Daqui em diante CorrePy já conseguiu montar notas.
-            # Se CPF/data divergirem, é erro real de validação e não deve cair em fallback.
             correpy_validating = True
+            all_dates_valid = True
             for note in notes:
                 if not hasattr(note, "reference_date") or note.reference_date is None:
-                    raise RuntimeError(
-                        f"Não foi possível obter a data do pregão na nota '{filename}'."
-                    )
+                    all_dates_valid = False
+                    continue
 
                 ref_date = note.reference_date
                 if ref_date.year != expected_year or ref_date.month != expected_month:
@@ -1280,7 +1693,12 @@ def read_brokerage_notes(
                             f"diferente do CPF informado {formatar_cpf(expected_cpf_digits)}."
                         )
 
-            return notes, "correpy"
+            if not all_dates_valid:
+                errors.append("CorrePy: uma ou mais notas foram montadas sem data de pregão válida.")
+            elif not _correpy_notes_have_valid_transactions(notes):
+                errors.append("CorrePy: não extraiu nenhuma transação com quantidade e preço utilizáveis.")
+            else:
+                return notes, "correpy"
 
     except InvalidPasswordException as e:
         raise PdfPasswordRequiredError(
@@ -1310,9 +1728,7 @@ def read_brokerage_notes(
     broker = _detect_broker(full_text)
 
     # ── 2) PARSER ESPECÍFICO DA CORRETORA ─────────────────────────────────────
-    if not _PDFPLUMBER_AVAILABLE:
-        errors.append("Parser específico: biblioteca pdfplumber não instalada.")
-    else:
+    if broker:
         parser_map = {
             "inter": _parse_inter_pdfplumber,
             "genial": _parse_genial_pdfplumber,
@@ -1325,6 +1741,8 @@ def read_brokerage_notes(
         else:
             try:
                 rows = specific_parser(pdf_path, password=password)
+                if not _rows_have_valid_operations(rows):
+                    raise RuntimeError("não extraiu nenhuma operação com quantidade, preço e valor utilizáveis.")
 
                 _validate_rows_against_month_cpf(
                     rows=rows,
@@ -1344,9 +1762,11 @@ def read_brokerage_notes(
             except Exception as e:
                 errors.append(f"Parser específico ({broker}): {e}")
 
-    # ── 3) PARSER GENÉRICO ────────────────────────────────────────────────────
+    # ── 3) PARSER GENÉRICO TABULAR ────────────────────────────────────────────
     try:
         rows = _parse_generic_text_bovespa(pdf_path, password=password)
+        if not _rows_have_valid_operations(rows):
+            raise RuntimeError("não extraiu nenhuma operação com quantidade, preço e valor utilizáveis.")
 
         _validate_rows_against_month_cpf(
             rows=rows,
@@ -1366,12 +1786,40 @@ def read_brokerage_notes(
     except BrokerageNoteValidationError:
         raise
     except Exception as e:
-        errors.append(f"Parser genérico: {e}")
+        errors.append(f"Parser genérico tabular: {e}")
 
-    # ── 4) TELA DE REVISÃO MANUAL ASSISTIDA ───────────────────────────────────
+    # ── 4) PARSER GENÉRICO VERTICAL ───────────────────────────────────────────
+    try:
+        rows = _parse_generic_vertical_bovespa(pdf_path, password=password)
+        if not _rows_have_valid_operations(rows):
+            raise RuntimeError("não extraiu nenhuma operação com quantidade, preço e valor utilizáveis.")
+
+        _validate_rows_against_month_cpf(
+            rows=rows,
+            filename=filename,
+            expected_year=expected_year,
+            expected_month=expected_month,
+            expected_cpf_digits=expected_cpf_digits,
+            pdf_path=pdf_path,
+            password=password,
+        )
+
+        operations = _build_operations_from_pdfplumber_rows(rows, filename, "generic_vertical")
+        for op in operations:
+            op.parser_used = "generic_vertical"
+        return operations, "generic_vertical"
+
+    except BrokerageNoteValidationError:
+        raise
+    except Exception as e:
+        errors.append(f"Parser genérico vertical: {e}")
+
+    # ── 5) TELA DE REVISÃO MANUAL ASSISTIDA ───────────────────────────────────
     if manual_review_cb is not None:
         rows = manual_review_cb(filename, full_text, errors)
         if rows:
+            if not _rows_have_valid_operations(rows):
+                raise RuntimeError("Revisão manual: nenhuma operação com quantidade, preço e valor utilizáveis.")
             _validate_rows_against_month_cpf(
                 rows=rows,
                 filename=filename,
@@ -1491,6 +1939,7 @@ def parse_month_folder(
 
                 for tx in note.transactions:
                     amount = tx.amount
+                    security_label = tx.security.ticker or tx.security.name or "ATIVO NAO IDENTIFICADO"
                     if amount is None or amount <= 0:
                         if raw_text_for_quantity is None:
                             raw_text_for_quantity = _extract_text_from_pdf(pdf_path, password=senha_arquivo)
@@ -1510,20 +1959,20 @@ def parse_month_folder(
                             amount_user = ask_quantity_cb(
                                 filename,
                                 note.reference_date,
-                                tx.security.ticker,
+                                security_label,
                                 tx.transaction_type.value,
                                 tx.unit_price,
                             )
                             if amount_user is None:
                                 raise RuntimeError(
                                     f"Operação cancelada: quantidade não informada para "
-                                    f"{tx.security.ticker} em {note.reference_date:%d/%m/%Y}."
+                                    f"{security_label} em {note.reference_date:%d/%m/%Y}."
                                 )
                             amount = amount_user
 
                     if amount is None or amount <= 0:
                         raise RuntimeError(
-                            f"Quantidade inválida para {tx.security.ticker} "
+                            f"Quantidade inválida para {security_label} "
                             f"em {note.reference_date:%d/%m/%Y} no arquivo '{filename}'."
                         )
 
@@ -1568,7 +2017,7 @@ def parse_month_folder(
 
                     op = Operation(
                         ref_date=note.reference_date,
-                        ticker=tx.security.ticker,
+                        ticker=normalize_b3_ticker(tx.security.ticker),
                         name=tx.security.name,
                         transaction_type=tx.transaction_type.value,
                         amount=amount,
@@ -1606,6 +2055,7 @@ def classify_operations(ops: List[Operation]) -> None:
 
     group_map: Dict[Tuple[str, date, str], List[Operation]] = {}
     for op in ops:
+        op.ticker = normalize_b3_ticker(op.ticker)
         key = (op.note_file, op.ref_date, op.ticker)
         group_map.setdefault(key, []).append(op)
 
@@ -1690,7 +2140,7 @@ def process_results(
             positions[ticker] = []
             continue
         total_cost = sum(q * c for q, c in lots)
-        avg_cost = total_cost / total_qty if total_qty > 0 else Decimal("0")
+        avg_cost = total_cost / total_qty
         positions[ticker] = [(total_qty, avg_cost)]
 
     # Resultados swing separados por elegibilidade à isenção
@@ -1721,7 +2171,7 @@ def process_results(
             day_groups.setdefault(key, []).append(op)
             continue
 
-        ticker = op.ticker.strip().upper()
+        ticker = normalize_b3_ticker(op.ticker) or ""
 
         if op.category == "fii":
             irrf_fii += (op.irrf or Decimal(0))
@@ -1995,6 +2445,7 @@ def update_month_sheet(
     """
     sheet = workbook[sheet_name]
 
+    sheet["A6"] = "PERÍODO DE APURAÇÃO: " + sheet_name.strip()
     sheet["A7"] = "INVESTIDOR: " + name
     sheet["A8"] = "CPF: " + formatar_cpf(cpf)
 
@@ -2049,9 +2500,9 @@ def read_initial_portfolio_from_year_sheet(
     workbook,
     year_sheet_name: str,
 ) -> Dict[str, List[Tuple[Decimal, Decimal]]]:
-    """Lê a carteira do mês anterior na aba anual.
+    """Lê as carteiras do mês anterior na aba anual.
 
-    A aba deve ter o cabeçalho 'ATIVOS EM CARTEIRA' com colunas:
+    Cada carteira deve ter o título exato 'ATIVOS EM CARTEIRA' com colunas:
         PAPEL | QUANTIDADE | PREÇO MÉDIO | CUSTO TOTAL
     """
     if year_sheet_name not in workbook.sheetnames:
@@ -2059,43 +2510,54 @@ def read_initial_portfolio_from_year_sheet(
             f"A aba anual '{year_sheet_name}' não foi encontrada na planilha."
         )
 
-    sheet      = workbook[year_sheet_name]
-    header_row = None
-    header_col = None
-
-    for row in range(1, sheet.max_row + 1):
-        for col in range(1, sheet.max_column + 1):
-            value = sheet.cell(row=row, column=col).value
-            if isinstance(value, str) and value.strip().lower() == "ativos em carteira":
-                header_row = row
-                header_col = col
-                break
-        if header_row is not None:
-            break
-
-    if header_row is None:
-        raise RuntimeError(
-            f"Cabeçalho 'ATIVOS EM CARTEIRA' não encontrado na aba '{year_sheet_name}'."
-        )
-
+    sheet = workbook[year_sheet_name]
     positions: Dict[str, List[Tuple[Decimal, Decimal]]] = {}
-    row = header_row + 1
+    found_valid_table = False
 
-    while row <= sheet.max_row:
-        ticker = sheet.cell(row=row, column=header_col).value
-        if ticker is None or (isinstance(ticker, str) and not ticker.strip()):
-            break
-        if isinstance(ticker, str) and "valor total de patrimônio acumulado" in ticker.lower():
-            break
+    for title_row in range(1, sheet.max_row + 1):
+        for title_col in range(1, sheet.max_column + 1):
+            title = sheet.cell(row=title_row, column=title_col).value
+            if not isinstance(title, str) or title.strip().lower() != "ativos em carteira":
+                continue
 
-        ticker_str = str(ticker).strip().upper()
-        qty        = _to_decimal(sheet.cell(row=row, column=header_col + 1).value)
-        avg_price  = _to_decimal(sheet.cell(row=row, column=header_col + 2).value)
+            columns_row = title_row + 1
+            papel = sheet.cell(row=columns_row, column=title_col).value
+            quantidade = sheet.cell(row=columns_row, column=title_col + 1).value
+            preco_medio = sheet.cell(row=columns_row, column=title_col + 2).value
 
-        if ticker_str and qty is not None and avg_price is not None and qty > 0:
-            positions.setdefault(ticker_str, []).append((qty, avg_price))
+            if (
+                not isinstance(papel, str)
+                or papel.strip().lower() != "papel"
+                or not isinstance(quantidade, str)
+                or quantidade.strip().lower() != "quantidade"
+                or not isinstance(preco_medio, str)
+                or preco_medio.strip().lower() not in ("preço médio", "preco medio")
+            ):
+                continue
 
-        row += 1
+            found_valid_table = True
+            row = columns_row + 1
+
+            while row <= sheet.max_row:
+                ticker = sheet.cell(row=row, column=title_col).value
+                if ticker is None or (isinstance(ticker, str) and not ticker.strip()):
+                    break
+                if isinstance(ticker, str) and "valor total de patrimônio acumulado" in ticker.lower():
+                    break
+
+                ticker_str = normalize_b3_ticker(str(ticker)) or ""
+                qty = _to_decimal(sheet.cell(row=row, column=title_col + 1).value)
+                avg_price = _to_decimal(sheet.cell(row=row, column=title_col + 2).value)
+
+                if ticker_str and qty is not None and avg_price is not None and qty != 0:
+                    positions.setdefault(ticker_str, []).append((qty, avg_price))
+
+                row += 1
+
+    if not found_valid_table:
+        raise RuntimeError(
+            f"Tabela válida 'ATIVOS EM CARTEIRA' não encontrada na aba '{year_sheet_name}'."
+        )
 
     return positions
 
@@ -2142,7 +2604,7 @@ class ApuracaoB3App:
         self.master   = master
         self.base_dir = base_dir
 
-        self.master.title("Calculadora B3 - Notas de Corretagem")
+        self.master.title("Calculadora B3 - Notas de Corretagem                                             v 1.0")
         W, H = 550, 390
         self.master.geometry(f"{W}x{H}")
         self.master.resizable(False, False)
@@ -2333,14 +2795,30 @@ class ApuracaoB3App:
         win.title("Ticker necessário")
         win.grab_set()
 
-        msg = (
-            "Não foi possível identificar o TICKER automaticamente.\n\n"
-            f"Arquivo: {note_file}\n"
-            f"Data: {ref_date:%d/%m/%Y}\n"
-            f"Ativo (nome na nota): {name}\n\n"
-            "Digite o ticker (ex.: PETR4, VALE3, HGLG11):"
+        tk.Label(
+            win,
+            text=(
+                "Não foi possível identificar o TICKER automaticamente.\n\n"
+                f"Arquivo: {note_file}\n"
+                f"Data: {ref_date:%d/%m/%Y}"
+            ),
+            justify="left",
+            anchor="w",
+        ).pack(padx=10, pady=(10, 4), anchor="w")
+
+        tk.Label(win, text="Ativo (nome na nota):", anchor="w").pack(
+            padx=10, pady=(4, 0), anchor="w"
         )
-        tk.Label(win, text=msg, justify="left", anchor="w").pack(padx=10, pady=10)
+        name_var = tk.StringVar(value=name)
+        name_entry = tk.Entry(win, textvariable=name_var, width=50, state="readonly")
+        name_entry.pack(padx=10, pady=(0, 10), fill="x")
+        name_entry.bind("<Control-a>", lambda event: (name_entry.select_range(0, "end"), "break"))
+
+        tk.Label(
+            win,
+            text="Digite o ticker (ex.: PETR4, VALE3, HGLG11):",
+            anchor="w",
+        ).pack(padx=10, pady=(0, 5), anchor="w")
 
         ticker_var = tk.StringVar()
         entry = tk.Entry(win, textvariable=ticker_var, width=30)
@@ -2821,7 +3299,7 @@ class ApuracaoB3App:
                 # Já preenchido (ex.: por um parser futuro mais esperto)
                 continue
 
-            ticker = (op.ticker or "").upper().strip()
+            ticker = normalize_b3_ticker(op.ticker) or ""
 
             # Tenta detecção automática
             tipo = detect_asset_type(op.name, ticker)
@@ -2968,18 +3446,18 @@ class ApuracaoB3App:
             # 2. Resolve tickers ausentes
             for op in operations:
                 if op.ticker and str(op.ticker).strip():
-                    op.ticker = str(op.ticker).strip().upper()
+                    op.ticker = normalize_b3_ticker(op.ticker)
                     continue
                 key = op.name
                 if key in self.ticker_map:
-                    op.ticker = self.ticker_map[key]
+                    op.ticker = normalize_b3_ticker(self.ticker_map[key])
                     continue
                 t = self._pedir_ticker(op.note_file, op.ref_date, op.name)
                 if not t:
                     raise RuntimeError(
                         f"Apuração cancelada: ticker não informado para '{op.name}'."
                     )
-                t = t.strip().upper()
+                t = normalize_b3_ticker(t) or ""
                 self.ticker_map[key] = t
                 self._save_ticker_map()
                 op.ticker = t
@@ -3058,7 +3536,7 @@ class ApuracaoB3App:
 
 
 ###############################################################################
-# Ponto de entrada
+# MAIN: inicializa a GUI e executa o loop principal do Tkinter
 ###############################################################################
 
 if __name__ == "__main__":
