@@ -2604,7 +2604,7 @@ class ApuracaoB3App:
         self.master   = master
         self.base_dir = base_dir
 
-        self.master.title("Calculadora B3 - Notas de Corretagem                                             v 1.0")
+        self.master.title("Calculadora B3 - Notas de Corretagem                                             v 1.1")
         W, H = 550, 390
         self.master.geometry(f"{W}x{H}")
         self.master.resizable(False, False)
