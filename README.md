@@ -22,8 +22,8 @@
 
 ## REGRAS DE CÁLCULO DE RESULTADO E APURAÇÃO:
     - Soma as VENDAS de ON+PN do mês:
-   - Se total de vendas ON+PN < R$20.000 → lucro vai para J20 (ganho isento).
-   - Se total de vendas ON+PN ≥ R$20.000 → lucro vai para B15 (tributável a 15%).
+       - Se total de vendas ON+PN < R$20.000 → lucro vai para J20 (ganho isento).
+       - Se total de vendas ON+PN ≥ R$20.000 → lucro vai para B15 (tributável a 15%).
     - Independente da regra acima - BDR, UNITS e ETF sempre vão para B15 sem isenção (tributável a 15%).
     - Independente da regra acima - FIIs sempre vão para B49 com sem isenção (tributável a 20%).
     - O resultado final da apuração mensal é a soma de B15 (lucro tributável -> ON+PN+BDR+UNITS+ETF) + B49 (lucro FII)
