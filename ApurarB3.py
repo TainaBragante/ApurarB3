@@ -32,6 +32,7 @@ ASSET_TYPE_FIAGRO = "FIAGRO"  # Fundo Agroindustrial          → sem isenção,
 ASSET_TYPE_BDR    = "BDR"     # Brazilian Depositary Receipt  → sem isenção, 15% swing
 ASSET_TYPE_UNITS  = "UNITS"   # Units                         → sem isenção, 15% swing
 ASSET_TYPE_ETF    = "ETF"     # Exchange Traded Fund          → sem isenção, 15% swing
+ASSET_TYPE_ISENTO = "ISENTO"  # FII-Infra, FIP-IE e ETF RF    → isolado, sem IR na apuração
 
 # Conjunto de tipos que NÃO têm isenção de 20k
 ASSET_TYPES_SEM_ISENCAO = {
@@ -42,8 +43,30 @@ ASSET_TYPES_SEM_ISENCAO = {
 # Conjunto de tipos que TÊM isenção de 20k (ON e PN)
 ASSET_TYPES_COM_ISENCAO = {ASSET_TYPE_ON, ASSET_TYPE_PN}
 
+# Ativos tratados de forma isolada na apuração: não entram na base de imposto, não geram prejuízo a compensar e têm as vendas informadas em G29/J29.
+ATIVOS_ISENTOS_TICKERS_CONHECIDOS = {
+    # ETF RF (16 conhecidos)
+    "B5MB11", "B5P211", "BDAP11", "DEBB11", "FIXA11", "IB5M11", "IMAB11", "IRFM11", "LFTB11", "LFTS11", "BOL511", "BPRE11", "BLFT11", "PACC11", "PACL11", "PACG11",
+
+    # FII Infra (20 conhecidos)
+    "BODB11", "BODI11", "BINC11", "BISE11", "BRZD11", "BDIF11", "CPTI11", "CPDI11", "INFB11", "EXIF11", "VANG11", "BIDB11", "IRIF11", "IFRI11", "IFRA11", "ISNN11", "ISNT11", "ISEN11", "ISET11", "ISTT11",
+
+    # FIP-IE (17 conhecidos)
+    "AZIN11", "BDIV11", "BRZP11", "ENDD11", "ESUU11", "ESUD11", "ESUT11", "KNDI11", "KNOX11", "NVRP11", "OPHF11", "PICE11", "PFIN11", "PLBR11", "PPEI11", "VIGT11", "XPIE11",
+}
+
 # Limite de isenção mensal de IR para ON e PN (R$ 20.000,00 em vendas)
 LIMITE_ISENCAO_ON_PN = Decimal("20000.00")
+
+# Células da aba mensal que a calculadora escreve diretamente.
+MONTH_OUTPUT_CELLS = (
+    "A6", "A7", "A8",
+    "B15", "C15",
+    "C36", "C39",
+    "B49", "B56",
+    "G21", "J21",
+    "G29", "J29",
+)
 
 # Lista de 112 tickers de ETFs conhecidos para detecção automática (sem necessidade de perguntar ao usuário).
 # Lista exportada do site da B3 "https://www.b3.com.br/pt_br/produtos-e-servicos/negociacao/renda-variavel/etf/renda-variavel/etfs-listados/" 
@@ -301,6 +324,9 @@ def detect_asset_type(name: str, ticker: Optional[str]) -> Optional[str]:
     name_upper = (name or "").upper().strip()
     ticker_upper = (ticker or "").upper().strip()
 
+    if ticker_upper in ATIVOS_ISENTOS_TICKERS_CONHECIDOS:
+        return ASSET_TYPE_ISENTO
+
     # ── 1. ETF CONHECIDO POR TICKER ──────────────────────────────────────────
     # Verifica a lista de ETFs conhecidos.
     if ticker_upper in ETF_TICKERS_CONHECIDOS:
@@ -528,8 +554,125 @@ def _extract_and_apply_financial_summary(
 
 
 ###############################################################################
-# CAMADA 2 — PARSERS ESPECÍFICOS POR CORRETORA (Inter, Genial)
+# CAMADA 2 — PARSERS ESPECÍFICOS POR CORRETORA (Inter e Genial)
 ###############################################################################
+
+# Fallback Inter: lê operações quando pdfplumber não estrutura a tabela em colunas.
+def _parse_inter_vertical_text_fallback(
+    lines: List[str],
+    ref_date: date,
+    cpf_digits: Optional[str],
+) -> List[dict]:
+    """Aceita layout vertical Inter: Bovespa, VIS, C/V, quantidade, preço, total, D/C, nome."""
+    money = r"(?:R\$\s*)?(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2,6}"
+    qty = r"\d{1,12}(?:\.\d{3})*"
+    rows: List[dict] = []
+
+    i = 0
+    while i < len(lines):
+        inline_match = re.match(
+            rf"^(?:BOVESPA|B3)\s+([CV])\s+(VISTA|VIS|FRACION\w*)\s+(.+?)\s+({qty})\s+({money})\s+({money})\s+[DC]$",
+            lines[i].strip(),
+            re.IGNORECASE,
+        )
+        if inline_match:
+            cv = inline_match.group(1).upper()
+            name = inline_match.group(3).strip()
+            amount = _parse_integer_br(inline_match.group(4))
+            unit_price = _parse_decimal_br(inline_match.group(5))
+            total_value = _parse_decimal_br(inline_match.group(6))
+            if amount is not None and amount > 0 and unit_price is not None and unit_price > 0:
+                if total_value is None or total_value <= 0:
+                    total_value = amount * unit_price
+                ticker_match = re.search(r"\b[A-Z]{4}\d{1,2}[A-Z]?\b", name.upper())
+                ticker = normalize_b3_ticker(ticker_match.group(0)) if ticker_match else None
+                rows.append({
+                    "ref_date": ref_date,
+                    "ticker": ticker,
+                    "name": name or ticker or "ATIVO NAO IDENTIFICADO",
+                    "transaction_type": "buy" if cv == "C" else "sell",
+                    "amount": amount,
+                    "unit_price": unit_price,
+                    "total_value": total_value,
+                    "settlement_fee_note": Decimal("0"),
+                    "emoluments_note": Decimal("0"),
+                    "registration_fee_note": Decimal("0"),
+                    "transfer_fee_note": Decimal("0"),
+                    "ana_fee_note": Decimal("0"),
+                    "other_fee_note": Decimal("0"),
+                    "irrf": Decimal("0"),
+                    "cpf": cpf_digits,
+                })
+            i += 1
+            continue
+
+        if not re.fullmatch(r"BOVESPA|B3", lines[i].strip(), re.IGNORECASE):
+            i += 1
+            continue
+        if i + 6 >= len(lines):
+            break
+
+        market = lines[i + 1].strip()
+        cv = lines[i + 2].strip().upper()
+        if not re.search(r"VISTA|VIS|FRACION", market, re.IGNORECASE) or cv not in ("C", "V"):
+            i += 1
+            continue
+        if (
+            not re.fullmatch(qty, lines[i + 3].strip())
+            or not re.fullmatch(money, lines[i + 4].strip())
+            or not re.fullmatch(money, lines[i + 5].strip())
+            or lines[i + 6].strip().upper() not in ("C", "D")
+        ):
+            i += 1
+            continue
+
+        amount = _parse_integer_br(lines[i + 3])
+        unit_price = _parse_decimal_br(lines[i + 4])
+        total_value = _parse_decimal_br(lines[i + 5])
+        if amount is None or amount <= 0 or unit_price is None or unit_price <= 0:
+            i += 1
+            continue
+        if total_value is None or total_value <= 0:
+            total_value = amount * unit_price
+
+        name_parts: List[str] = []
+        j = i + 7
+        while j < len(lines):
+            candidate = lines[j].strip()
+            if (
+                not candidate
+                or re.fullmatch(r"BOVESPA|B3", candidate, re.IGNORECASE)
+                or re.search(r"RESUMO|TOTAL|L[IÍ]QUIDO|OBSERVA", candidate, re.IGNORECASE)
+            ):
+                break
+            name_parts.append(candidate)
+            j += 1
+
+        name = " ".join(name_parts).strip()
+        ticker_match = re.search(r"\b[A-Z]{4}\d{1,2}[A-Z]?\b", name.upper())
+        ticker = normalize_b3_ticker(ticker_match.group(0)) if ticker_match else None
+
+        rows.append({
+            "ref_date": ref_date,
+            "ticker": ticker,
+            "name": name or ticker or "ATIVO NAO IDENTIFICADO",
+            "transaction_type": "buy" if cv == "C" else "sell",
+            "amount": amount,
+            "unit_price": unit_price,
+            "total_value": total_value,
+            "settlement_fee_note": Decimal("0"),
+            "emoluments_note": Decimal("0"),
+            "registration_fee_note": Decimal("0"),
+            "transfer_fee_note": Decimal("0"),
+            "ana_fee_note": Decimal("0"),
+            "other_fee_note": Decimal("0"),
+            "irrf": Decimal("0"),
+            "cpf": cpf_digits,
+        })
+        i = max(j, i + 7)
+
+    return rows
+
 
 # Parser específico Inter: mantém a leitura de operações por tabela pdfplumber.
 def _parse_inter_pdfplumber(pdf_path: str, password: Optional[str] = None) -> List[dict]:
@@ -559,11 +702,11 @@ def _parse_inter_pdfplumber(pdf_path: str, password: Optional[str] = None) -> Li
         if raw_line and raw_line.strip()
     ]
 
-    # Extrai data do pregão: "Data pregão: DD/MM/AAAA"
-    date_match = re.search(r"Data\s+preg[aã]o[:\s]+(\d{2}/\d{2}/\d{4})", full_text, re.IGNORECASE)
-    if not date_match:
-        raise RuntimeError("Parser Inter: não foi possível localizar a data do pregão.")
-    ref_date = _parse_date_br(date_match.group(1))
+    # Extrai data do pregão do texto completo da nota
+    try:
+        ref_date = _extract_ref_date_from_text(full_text)
+    except RuntimeError as exc:
+        raise RuntimeError("Parser Inter: não foi possível localizar a data do pregão.") from exc
 
     # Extrai CPF do cliente
     cpf_match = re.search(r"\b(\d{3}[\.\s]?\d{3}[\.\s]?\d{3}[\-\s]?\d{2})\b", full_text)
@@ -629,6 +772,9 @@ def _parse_inter_pdfplumber(pdf_path: str, password: Optional[str] = None) -> Li
                         "irrf": irrf_note,
                         "cpf": cpf_digits,
                     })
+
+    if not operations:
+        operations = _parse_inter_vertical_text_fallback(lines, ref_date, cpf_digits)
 
     if not operations:
         raise RuntimeError("Parser Inter (pdfplumber): nenhuma operação encontrada na tabela da nota.")
@@ -1373,6 +1519,57 @@ def _parse_generic_vertical_bovespa(pdf_path: str, password: Optional[str] = Non
     return rows
 
 
+def _parse_generic_vertical_rows_by_page(
+    pdf_path: str,
+    password: Optional[str] = None,
+) -> List[dict]:
+    """Extrai operações verticais página a página, preservando a data de cada nota.
+
+    Usado como fallback para completar operações quando o CorrePy leu taxas/IRRF,
+    mas falhou em alguma quantidade.
+    """
+    rows: List[dict] = []
+
+    doc = fitz.open(pdf_path)
+    if password:
+        try:
+            doc.authenticate(password)
+        except Exception:
+            pass
+
+    for page in doc:
+        page_text = page.get_text("text")
+        try:
+            ref_date = _extract_ref_date_from_text(page_text)
+        except RuntimeError:
+            continue
+
+        cpf_digits = _extract_cpf_from_text(page_text)
+        lines = [
+            re.sub(r"\s+", " ", raw_line).strip()
+            for raw_line in page_text.splitlines()
+            if raw_line and raw_line.strip()
+        ]
+
+        for start_mode in ("separate_cv", "leading_cv"):
+            rows.extend(_parse_vertical_operation_blocks(
+                lines=lines,
+                ref_date=ref_date,
+                cpf_digits=cpf_digits,
+                settlement_fee=Decimal("0"),
+                registration_fee=Decimal("0"),
+                transfer_fee=Decimal("0"),
+                ana_fee=Decimal("0"),
+                emoluments=Decimal("0"),
+                other_fee=Decimal("0"),
+                irrf_note=Decimal("0"),
+                start_mode=start_mode,
+            ))
+
+    doc.close()
+    return rows
+
+
 # Função comum dos parsers verticais: converte blocos de texto em linhas de operação.
 def _parse_vertical_operation_blocks(
     lines: List[str],
@@ -1867,6 +2064,39 @@ def is_fii(name: str, ticker: Optional[str]) -> bool:
     return False
 
 
+def _append_operations_from_rows_with_note_fees(
+    operations: List[Operation],
+    rows: List[dict],
+    filename: str,
+    parser_used: str,
+    total_fees: Decimal,
+    note_irrf: Decimal,
+) -> None:
+    """Adiciona operações de linhas alternativas usando taxas/IRRF da nota CorrePy."""
+    total_value_note = sum(r["total_value"] for r in rows)
+    if total_value_note <= 0:
+        raise RuntimeError(
+            f"O arquivo '{filename}' gerou valor total inválido (0) no parser alternativo."
+        )
+
+    for r in rows:
+        proportion = r["total_value"] / total_value_note
+        operations.append(Operation(
+            ref_date=r["ref_date"],
+            ticker=normalize_b3_ticker(r.get("ticker")),
+            name=r.get("name") or r.get("ticker") or "ATIVO NAO IDENTIFICADO",
+            transaction_type=r["transaction_type"],
+            amount=r["amount"],
+            unit_price=r["unit_price"],
+            total_value=r["total_value"],
+            allocated_fee=total_fees * proportion,
+            irrf=note_irrf * proportion,
+            note_file=filename,
+            asset_type=None,
+            parser_used=parser_used,
+        ))
+
+
 def parse_month_folder(
     month_folder: str,
     expected_year: int,
@@ -1874,7 +2104,6 @@ def parse_month_folder(
     expected_cpf_digits: str,
     password_map: Optional[Dict[str, Optional[str]]] = None,
     ask_password_cb: Optional[Callable[[str], Optional[str]]] = None,
-    ask_quantity_cb: Optional[Callable[[str, date, str, str, Decimal], Optional[Decimal]]] = None,
     ask_manual_review_cb: Optional[Callable[[str, str, List[str]], Optional[List[dict]]]] = None,
 ) -> List[Operation]:
     """Varre a pasta do mês e extrai todas as operações.
@@ -1926,6 +2155,7 @@ def parse_month_folder(
         if source == "correpy":
             notes = result
             raw_text_for_quantity: Optional[str] = None
+            fallback_rows_by_date: Optional[Dict[date, List[dict]]] = None
             transfer_fee_pattern = r"Taxa\s+de\s+(?:Transfer[eê]ncia|Tranfer[eê]ncia|Transf\.?)\s+de\s+Ativos"
             transfer_fee_by_date = _extract_fee_by_ref_date_from_pdf(
                 pdf_path,
@@ -1952,39 +2182,25 @@ def parse_month_folder(
                         if recovered_amount is not None:
                             amount = recovered_amount
                         else:
-                            if ask_quantity_cb is None:
-                                raise RuntimeError(
-                                    "Quantidade zerada encontrada, mas não há callback para solicitar ao usuário."
-                                )
-                            amount_user = ask_quantity_cb(
-                                filename,
-                                note.reference_date,
-                                security_label,
-                                tx.transaction_type.value,
-                                tx.unit_price,
-                            )
-                            if amount_user is None:
-                                raise RuntimeError(
-                                    f"Operação cancelada: quantidade não informada para "
-                                    f"{security_label} em {note.reference_date:%d/%m/%Y}."
-                                )
-                            amount = amount_user
+                            if fallback_rows_by_date is None:
+                                fallback_rows_by_date = {}
+                                for fallback_row in _parse_generic_vertical_rows_by_page(
+                                    pdf_path,
+                                    password=senha_arquivo,
+                                ):
+                                    fallback_rows_by_date.setdefault(
+                                        fallback_row["ref_date"],
+                                        [],
+                                    ).append(fallback_row)
+                            break
 
                     if amount is None or amount <= 0:
-                        raise RuntimeError(
-                            f"Quantidade inválida para {security_label} "
-                            f"em {note.reference_date:%d/%m/%Y} no arquivo '{filename}'."
-                        )
+                        break
 
                     corrected_amounts.append(amount)
                     tx_value = tx.unit_price * amount
                     corrected_tx_values.append(tx_value)
                     total_value_note += tx_value
-
-                if total_value_note == 0:
-                    raise RuntimeError(
-                        f"O arquivo '{filename}' gerou valor total inválido (0)."
-                    )
 
                 if raw_text_for_quantity is None:
                     raw_text_for_quantity = _extract_text_from_pdf(pdf_path, password=senha_arquivo)
@@ -2009,6 +2225,28 @@ def parse_month_folder(
                     + note.emoluments + transfer_fee_note + note.operational_fee + note.others
                 )
                 note_irrf = getattr(note, "irrf", Decimal("0")) or Decimal("0")
+
+                if len(corrected_amounts) != len(note.transactions) or total_value_note <= 0:
+                    fallback_rows = (
+                        fallback_rows_by_date.get(note.reference_date, [])
+                        if fallback_rows_by_date is not None
+                        else []
+                    )
+                    if not fallback_rows:
+                        raise RuntimeError(
+                            f"CorrePy trouxe quantidade inválida em '{filename}' "
+                            f"({note.reference_date:%d/%m/%Y}) e nenhum parser alternativo "
+                            "conseguiu recuperar as operações."
+                        )
+                    _append_operations_from_rows_with_note_fees(
+                        operations=operations,
+                        rows=fallback_rows,
+                        filename=filename,
+                        parser_used="correpy+generic_vertical",
+                        total_fees=total_fees,
+                        note_irrf=note_irrf,
+                    )
+                    continue
 
                 for idx, tx in enumerate(note.transactions):
                     amount = corrected_amounts[idx]
@@ -2093,7 +2331,10 @@ def classify_operations(ops: List[Operation]) -> None:
                 continue
             o.category = (
                 "fii"
-                if o.asset_type in (ASSET_TYPE_FII, ASSET_TYPE_FIAGRO) or is_fii(o.name, o.ticker)
+                if (
+                    o.asset_type in (ASSET_TYPE_FII, ASSET_TYPE_FIAGRO)
+                    or (o.asset_type != ASSET_TYPE_ISENTO and is_fii(o.name, o.ticker))
+                )
                 else "swing"
             )
             new_ops.append(o)
@@ -2109,7 +2350,8 @@ def process_results(
 ) -> Tuple[
     Decimal, Decimal, Decimal, Decimal,  # result_swing_isento, result_swing_tributavel, result_day, result_fii
     Decimal, Decimal, Decimal,           # irrf_swing, irrf_day, irrf_fii
-    Decimal, Decimal,                    # vendas_on_pn, vendas_outros (para G20 e regra dos 20k)
+    Decimal, Decimal,                    # vendas_on_pn, vendas_outros (para G21 e regra dos 20k)
+    Decimal, Decimal,                    # vendas_isentos_swing, vendas_isentos_day (para G29/J29)
     Dict[str, List[Tuple[Decimal, Decimal]]],
     bool,
 ]:
@@ -2125,10 +2367,10 @@ def process_results(
 
     Também acumula separadamente:
     - vendas_on_pn  : total de vendas de ON+PN no mês (para regra dos 20k)
-    - vendas_outros : total de vendas dos demais tipos swing (para somar em G20)
+    - vendas_outros : total de vendas dos demais tipos swing (para somar em G21)
 
-    A decisão B15 vs J20 para ON+PN é feita em update_month_sheet(),
-    que recebe vendas_on_pn e compara com LIMITE_ISENCAO_ON_PN. O G20 recebe
+    A decisão B15 vs J21 para ON+PN é feita em update_month_sheet(),
+    que recebe vendas_on_pn e compara com LIMITE_ISENCAO_ON_PN. O G21 recebe
     vendas_on_pn + vendas_outros, mas esse total não altera a regra dos 20k.
     """
     ops_sorted = sorted(ops, key=lambda o: (o.ref_date, o.note_file))
@@ -2154,9 +2396,11 @@ def process_results(
     irrf_day   = Decimal(0)
     irrf_fii   = Decimal(0)
 
-    # Acumuladores de volume de vendas para cálculo de isenção e G20
+    # Acumuladores de volume de vendas para cálculo de isenção e G21
     vendas_on_pn  = Decimal(0)  # vendas de ON+PN; usado para a regra dos 20k
     vendas_outros = Decimal(0)  # vendas de BDR/UNITS/ETF e outros swing sem isenção
+    vendas_isentos_swing = Decimal(0)  # FII-Infra, FIP-IE e ETF RF em swing
+    vendas_isentos_day   = Decimal(0)  # FII-Infra, FIP-IE e ETF RF em day trade
 
     day_groups: Dict[Tuple[date, str, str], List[Operation]] = {}
 
@@ -2230,7 +2474,9 @@ def process_results(
                 # Separa o resultado pelo tipo do ativo para a regra de isenção
                 tipo = op.asset_type or ""
 
-                if tipo in ASSET_TYPES_COM_ISENCAO:
+                if tipo == ASSET_TYPE_ISENTO:
+                    vendas_isentos_swing += sale_value
+                elif tipo in ASSET_TYPES_COM_ISENCAO:
                     # ON ou PN: acumula no resultado elegível à isenção
                     result_swing_on_pn += profit
                     vendas_on_pn       += sale_value  # volume de venda para cálculo de 20k
@@ -2242,6 +2488,7 @@ def process_results(
     # Processa Day Trade
     for _, ops_day in day_groups.items():
         buy_total = sell_total = buy_fee = sell_fee = irrf_day_group = Decimal(0)
+        is_isento_day = all((op.asset_type or "") == ASSET_TYPE_ISENTO for op in ops_day)
 
         for op in ops_day:
             irrf_day_group += (op.irrf or Decimal(0))
@@ -2253,6 +2500,10 @@ def process_results(
                 sell_fee   += op.allocated_fee
 
         profit = (sell_total - sell_fee) - (buy_total + buy_fee)
+        if is_isento_day:
+            vendas_isentos_day += sell_total
+            continue
+
         result_day += profit
 
         if irrf_day_group > 0:
@@ -2272,6 +2523,7 @@ def process_results(
         result_day, result_fii,
         irrf_swing, irrf_day, irrf_fii,
         vendas_on_pn, vendas_outros,
+        vendas_isentos_swing, vendas_isentos_day,
         positions, has_negative_positions,
     )
 
@@ -2410,12 +2662,18 @@ def resolve_month_sheet_name(workbook, expected_month: int, expected_year: int) 
     return matches[0]
 
 
+def clear_month_output_cells(sheet) -> None:
+    """Limpa somente as células que a calculadora preenche na aba mensal."""
+    for cell in MONTH_OUTPUT_CELLS:
+        sheet[cell] = None
+
+
 def update_month_sheet(
     workbook,
     sheet_name: str,
     name: str,
     cpf: str,
-    result_swing_on_pn: Decimal,    # resultado de ON+PN (pode ir para J20 ou B15)
+    result_swing_on_pn: Decimal,    # resultado de ON+PN (pode ir para J21 ou B15)
     result_swing_outros: Decimal,   # resultado de BDR/UNITS/ETF (sempre B15)
     result_day: Decimal,
     result_fii: Decimal,
@@ -2423,7 +2681,9 @@ def update_month_sheet(
     irrf_day: Decimal,
     irrf_fii: Decimal,
     vendas_on_pn: Decimal,          # volume de vendas de ON+PN no mês; define a isenção de 20k
-    vendas_outros: Decimal,         # volume de vendas dos outros tipos swing; soma em G20
+    vendas_outros: Decimal,         # volume de vendas dos outros tipos swing; soma em G21
+    vendas_isentos_swing: Decimal = Decimal(0),
+    vendas_isentos_day: Decimal = Decimal(0),
 ):
     """Atualiza a aba do mês com os resultados da apuração.
 
@@ -2431,19 +2691,19 @@ def update_month_sheet(
     ┌─────────────────────────────────────────────────────────────────┐
     │ Tipo    │ Condição           │ Onde grava o resultado           │
     ├─────────┼────────────────────┼──────────────────────────────────┤
-    │ ON + PN │ Vendas < 20k       │ J20 (ganho isento)               │
+    │ ON + PN │ Vendas < 20k       │ J21 (ganho isento)               │
     │ ON + PN │ Vendas ≥ 20k       │ B15 (tributável)                 │
     │ BDR     │ sempre             │ B15 (tributável)                 │
     │ UNITS   │ sempre             │ B15 (tributável)                 │
     │ ETF     │ sempre             │ B15 (tributável)                 │
     └─────────┴────────────────────┴──────────────────────────────────┘
 
-    G20 recebe o total de alienações do mês para swing:
-    ON + PN + BDR + UNITS + ETF + demais tipos sem isenção.
-
-    A regra de isenção de 20k, porém, compara apenas vendas_on_pn.
+    G21 recebe o total de alienações do mês para swing de ON+PN apenas
+    J21 recebe o lucro de ON+PN apenas se o total de vendas de ON+PN for menor que 20k.
+    B15 recebe o lucro ou prejuízo de BDR/UNITS/ETF e também o lucro de ON+PN se o total de vendas de ON+PN for maior ou igual a 20k ou o prejuízo de ON+PN se houver, independentemente do total de vendas. O resultado de B15 é sempre tributável.
     """
     sheet = workbook[sheet_name]
+    clear_month_output_cells(sheet)
 
     sheet["A6"] = "PERÍODO DE APURAÇÃO: " + sheet_name.strip()
     sheet["A7"] = "INVESTIDOR: " + name
@@ -2461,19 +2721,22 @@ def update_month_sheet(
     sheet["C39"] = float(irrf_swing)
 
     # ── Swing Trade — ON e PN (lógica de isenção 20k) ─────────────────────────
-    # G20 mostra o total vendido no mês em swing, incluindo ativos sem isenção.
-    # A decisão de isenção continua usando somente vendas_on_pn.
-    sheet["G20"] = float(vendas_on_pn + vendas_outros)
+    sheet["G21"] = float(vendas_on_pn)
+    sheet["G29"] = float(vendas_isentos_swing)
+    sheet["J29"] = float(vendas_isentos_day)
 
     if vendas_on_pn < LIMITE_ISENCAO_ON_PN:
-        # Abaixo de 20k de vendas: lucro de ON+PN vai para J20 (ganho isento)
-        # B15 recebe APENAS o resultado dos outros tipos (BDR, UNITS, ETF)
-        sheet["J20"] = float(result_swing_on_pn)
-        sheet["B15"] = float(result_swing_outros)
+        # Abaixo de 20k: lucro de ON/PN é isento; prejuízo segue para B15.
+        if result_swing_on_pn > 0:
+            sheet["J21"] = float(result_swing_on_pn)
+            sheet["B15"] = float(result_swing_outros)
+        else:
+            sheet["J21"] = 0.0
+            sheet["B15"] = float(result_swing_on_pn + result_swing_outros)
     else:
         # Acima de 20k de vendas: lucro de ON+PN também vai para B15 (tributável)
-        # J20 fica zerado (não há ganho isento)
-        sheet["J20"] = 0.0
+        # J21 fica zerado (não há ganho isento)
+        sheet["J21"] = 0.0
         sheet["B15"] = float(result_swing_on_pn + result_swing_outros)
 
 
@@ -2604,7 +2867,7 @@ class ApuracaoB3App:
         self.master   = master
         self.base_dir = base_dir
 
-        self.master.title("Calculadora B3 - Notas de Corretagem                                             v 1.1")
+        self.master.title("Calculadora B3 - Notas de Corretagem                                             v 1.3")
         W, H = 550, 390
         self.master.geometry(f"{W}x{H}")
         self.master.resizable(False, False)
@@ -2628,8 +2891,8 @@ class ApuracaoB3App:
 
         # Mapa de tipos de ativo persistente: {ticker: tipo} (ON, PN, BDR, etc.)
         # Evita perguntar o mesmo ativo duas vezes em apurações futuras.
-        self.asset_type_map_path = get_data_path("asset_type_map.json")
-        self.asset_type_map: Dict[str, str] = load_json_dict(self.asset_type_map_path)
+        self.type_map_path = get_data_path("type_map.json")
+        self.type_map: Dict[str, str] = load_json_dict(self.type_map_path)
 
         # Últimas operações processadas (para exportar debug)
         self._last_operations: Optional[List[Operation]] = None
@@ -2736,59 +2999,6 @@ class ApuracaoB3App:
         self.master.wait_window(win)
         return None if result["cancelou"] else result["senha"]
 
-    def _pedir_quantidade_trade(
-        self,
-        note_file: str,
-        ref_date: date,
-        ticker: str,
-        tx_type: str,
-        unit_price: Decimal,
-    ) -> Optional[Decimal]:
-        """Modal para solicitar quantidade de um trade quando não identificada automaticamente."""
-        win = tk.Toplevel(self.master)
-        win.title("Quantidade necessária")
-        win.grab_set()
-
-        msg = (
-            "Não foi possível obter a quantidade desta operação automaticamente.\n\n"
-            f"Arquivo: {note_file}\n"
-            f"Data: {ref_date:%d/%m/%Y}\n"
-            f"Ticker: {ticker}\n"
-            f"Tipo: {tx_type}\n"
-            f"Preço: {unit_price:.2f}\n\n"
-            "Informe a quantidade (apenas o número inteiro):"
-        )
-        tk.Label(win, text=msg, justify="left", anchor="w").pack(padx=10, pady=10)
-
-        qty_var = tk.StringVar()
-        entry = tk.Entry(win, textvariable=qty_var, width=30)
-        entry.pack(padx=10, pady=5)
-        entry.focus_set()
-
-        result = {"qty": None}
-
-        def confirmar():
-            txt = (qty_var.get() or "").strip().replace(".", "")
-            if not txt or not txt.isdigit():
-                messagebox.showwarning("Valor inválido", "Digite apenas números.")
-                return
-            q = int(txt)
-            if q <= 0:
-                messagebox.showwarning("Valor inválido", "A quantidade deve ser maior que zero.")
-                return
-            result["qty"] = Decimal(q)
-            win.destroy()
-
-        def cancelar():
-            win.destroy()
-
-        btn = tk.Frame(win)
-        btn.pack(padx=10, pady=10, fill="x")
-        tk.Button(btn, text="OK",       command=confirmar).pack(side="right")
-        tk.Button(btn, text="Cancelar", command=cancelar).pack(side="left")
-        self.master.wait_window(win)
-        return result["qty"]
-
     def _pedir_ticker(self, note_file: str, ref_date: date, name: str) -> Optional[str]:
         """Modal para solicitar o ticker de um ativo não identificado automaticamente."""
         win = tk.Toplevel(self.master)
@@ -2857,8 +3067,8 @@ class ApuracaoB3App:
     ) -> Optional[str]:
         """Modal para solicitar o tipo do ativo quando a detecção automática falha.
 
-        Exibe botões para cada tipo possível (ON, PN, FII, FIAGRO, BDR, UNITS, ETF).
-        O tipo escolhido é salvo no asset_type_map (JSON) para não perguntar novamente.
+        Exibe botões para cada tipo possível (ON, PN, FII, FIAGRO, BDR, UNITS, ETF, ISENTO).
+        O tipo escolhido é salvo no type_map (JSON) para não perguntar novamente.
 
         Retorna o identificador canônico do tipo (ex.: "ON"), ou None se o usuário cancelar.
         """
@@ -2886,6 +3096,7 @@ class ApuracaoB3App:
             (ASSET_TYPE_BDR,    "BDR — Recibo negociável  (sem isenção)"),
             (ASSET_TYPE_UNITS,  "UNITS — Units / UNT  (sem isenção)"),
             (ASSET_TYPE_ETF,    "ETF — Fundo de índice  (sem isenção)"),
+            (ASSET_TYPE_ISENTO, "ISENTO — FII-Infra/FIP-IE/ETF RF  (isolado)"),
         ]
 
         result = {"tipo": None}
@@ -3039,7 +3250,7 @@ class ApuracaoB3App:
             ("nome",       "Nome do ativo\n(ex: PETROBRAS ON)", 22),
             ("quantidade", "Quantidade\n(ex: 100)", 10),
             ("preco",      "Preço unit.\n(ex: 28,50)", 10),
-            ("total",      "Total R$\n(opcional)", 10),
+            ("total",      "Total R$\n(ex: 2850,00)", 10),
         ]
 
         # Linha de cabeçalho da tabela
@@ -3275,9 +3486,9 @@ class ApuracaoB3App:
     def _save_ticker_map(self) -> None:
         save_json_dict(self.ticker_map_path, self.ticker_map)
 
-    def _save_asset_type_map(self) -> None:
+    def _save_type_map(self) -> None:
         """Salva o mapa de tipos de ativo no disco para reutilização em sessões futuras."""
-        save_json_dict(self.asset_type_map_path, self.asset_type_map)
+        save_json_dict(self.type_map_path, self.type_map)
 
     # ── Resolução de tipos de ativo ───────────────────────────────────────────
 
@@ -3286,9 +3497,9 @@ class ApuracaoB3App:
 
         Estratégia por operação:
         1. Tenta detect_asset_type() (automático por nome + ticker).
-        2. Se automático falhar, consulta o asset_type_map (JSON persistente).
+        2. Se automático falhar, consulta o type_map (JSON persistente).
         3. Se ainda não encontrar, abre o modal _pedir_tipo_ativo() para o usuário.
-        4. Salva a resposta no asset_type_map para não perguntar novamente.
+        4. Salva a resposta no type_map para não perguntar novamente.
 
         Operações de day trade não precisam de tipo para o cálculo de IR
         (day trade sempre vai para C15, independente de tipo), mas preenchemos
@@ -3306,7 +3517,7 @@ class ApuracaoB3App:
 
             if tipo is None:
                 # Consulta o mapa persistente pelo ticker
-                tipo = self.asset_type_map.get(ticker)
+                tipo = self.type_map.get(ticker)
 
             if tipo is None:
                 # Pergunta ao usuário
@@ -3322,8 +3533,8 @@ class ApuracaoB3App:
                         f"({op.name}) na nota '{op.note_file}'."
                     )
                 # Persiste para futuras apurações
-                self.asset_type_map[ticker] = tipo
-                self._save_asset_type_map()
+                self.type_map[ticker] = tipo
+                self._save_type_map()
 
             op.asset_type = tipo
 
@@ -3439,7 +3650,6 @@ class ApuracaoB3App:
                 expected_cpf_digits=cpf_limpo,
                 password_map=self.password_map,
                 ask_password_cb=self._pedir_senha_pdf,
-                ask_quantity_cb=self._pedir_quantidade_trade,
                 ask_manual_review_cb=self._revisao_manual_nota,
             )
 
@@ -3486,6 +3696,7 @@ class ApuracaoB3App:
                 result_day, result_fii,
                 irrf_swing, irrf_day, irrf_fii,
                 vendas_on_pn, vendas_outros,
+                vendas_isentos_swing, vendas_isentos_day,
                 updated_positions, has_negative_positions,
             ) = process_results(operations, initial_positions)
 
@@ -3505,6 +3716,8 @@ class ApuracaoB3App:
                 irrf_fii=irrf_fii,
                 vendas_on_pn=vendas_on_pn,
                 vendas_outros=vendas_outros,
+                vendas_isentos_swing=vendas_isentos_swing,
+                vendas_isentos_day=vendas_isentos_day,
             )
 
             write_portfolio_sheet_for_month(

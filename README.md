@@ -22,12 +22,11 @@
 
 ## REGRAS DE CÁLCULO DE RESULTADO E APURAÇÃO:
     - Soma as VENDAS de ON+PN do mês:
-       - Se total de vendas ON+PN < R$20.000 → lucro vai para J20 (ganho isento).
-       - Se total de vendas ON+PN ≥ R$20.000 → lucro vai para B15 (tributável a 15%).
-    - Independente da regra acima - BDR, UNITS e ETF sempre vão para B15 sem isenção (tributável a 15%).
-    - Independente da regra acima - FIIs sempre vão para B49 com sem isenção (tributável a 20%).
+       - Se total de vendas ON+PN < R$20.000 → PL isento vai para J21 e o total de alienação isenta vai para G21.
+       - Se total de vendas ON+PN ≥ R$20.000 → PL vai para B15 (tributável a 15%) junto com os outros tipos.
+    - Independente da regra acima - o PL de BDR, UNITS e ETF sempre vão para B15 sem isenção (tributável a 15%).
+    - Independente da regra acima - o PL de FIIs sempre vão para B49 sem isenção (tributável a 20%).
     - O resultado final da apuração mensal é a soma de B15 (lucro tributável -> ON+PN+BDR+UNITS+ETF) + B49 (lucro FII)
-    - Em G20 ficam o total de alienações dentro do mês ON+PN+BDR+UNITS+ETF.
 
 ## REGRAS DE PARSER EM CAMADAS:
     1ª Camada → CorrePy parser padrão, tenta identificar o padrão SINACOR com CorrePy
