@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='apurarB3',
+    name='CalculadoraB3',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

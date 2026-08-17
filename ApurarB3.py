@@ -9,7 +9,7 @@ import sys
 import json
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from copy import deepcopy
+from copy import copy, deepcopy
 from datetime import date
 from typing import Callable, Dict, List, Optional, Tuple
 from tkinter import filedialog, messagebox
@@ -2353,7 +2353,6 @@ def process_results(
     Decimal, Decimal,                    # vendas_on_pn, vendas_outros (para G21 e regra dos 20k)
     Decimal, Decimal,                    # vendas_isentos_swing, vendas_isentos_day (para G29/J29)
     Dict[str, List[Tuple[Decimal, Decimal]]],
-    bool,
 ]:
     """Calcula os resultados líquidos separados por tipo de ativo.
 
@@ -2361,7 +2360,7 @@ def process_results(
     - compra: soma o custo da compra ao custo total em carteira e recalcula o preço médio;
     - venda: baixa a quantidade vendida pelo preço médio vigente do ticker.
 
-    NOVO: O resultado de swing trade é separado em dois acumuladores:
+    O resultado de swing trade é separado em dois acumuladores:
     - result_swing_on_pn   : lucro/prejuízo de ON e PN (elegíveis à isenção de 20k)
     - result_swing_outros  : lucro/prejuízo de BDR, UNITS, ETF (sem isenção, sempre B15)
 
@@ -2404,6 +2403,28 @@ def process_results(
 
     day_groups: Dict[Tuple[date, str, str], List[Operation]] = {}
 
+    def add_realized_result(op: Operation, profit: Decimal, sale_value: Decimal) -> None:
+        """Acumula resultado realizado conforme categoria e tipo do ativo."""
+        nonlocal result_fii, result_swing_on_pn, result_swing_outros
+        nonlocal vendas_on_pn, vendas_outros, vendas_isentos_swing
+
+        if op.category == "fii":
+            result_fii += profit
+            return
+
+        if op.category != "swing":
+            return
+
+        tipo = op.asset_type or ""
+        if tipo == ASSET_TYPE_ISENTO:
+            vendas_isentos_swing += sale_value
+        elif tipo in ASSET_TYPES_COM_ISENCAO:
+            result_swing_on_pn += profit
+            vendas_on_pn += sale_value
+        else:
+            result_swing_outros += profit
+            vendas_outros += sale_value
+
     for op in ops_sorted:
         if op.category not in ("day", "swing", "fii"):
             raise RuntimeError(
@@ -2423,27 +2444,44 @@ def process_results(
             irrf_swing += (op.irrf or Decimal(0))
 
         if op.transaction_type == "buy":
-            purchase_cost = (op.unit_price * op.amount) + op.allocated_fee
+            buy_value = op.unit_price * op.amount
             current_qty, current_avg = (
                 positions.get(ticker, [(Decimal(0), Decimal(0))])[0]
                 if positions.get(ticker)
                 else (Decimal(0), Decimal(0))
             )
-            new_qty = current_qty + op.amount
 
-            if new_qty > 0:
-                if current_qty > 0:
-                    current_cost = current_qty * current_avg
-                    new_avg = (current_cost + purchase_cost) / new_qty
+            if current_qty < 0:
+                short_qty = -current_qty
+                cover_qty = min(op.amount, short_qty)
+                remaining_buy_qty = op.amount - cover_qty
+
+                cover_fee = op.allocated_fee * (cover_qty / op.amount) if op.amount else Decimal(0)
+                # current_avg é o preço médio líquido da venda descoberta, já com taxa da venda.
+                profit = (current_avg * cover_qty) - (op.unit_price * cover_qty) - cover_fee
+                add_realized_result(op, profit, Decimal(0))
+
+                new_qty = current_qty + cover_qty
+                if new_qty < 0:
+                    positions[ticker] = [(new_qty, current_avg)]
+                    continue
+
+                if remaining_buy_qty > 0:
+                    remaining_fee = op.allocated_fee - cover_fee
+                    new_avg = ((op.unit_price * remaining_buy_qty) + remaining_fee) / remaining_buy_qty
+                    positions[ticker] = [(remaining_buy_qty, new_avg)]
                 else:
-                    # Se havia posição negativa, o custo médio passa a refletir
-                    # apenas a sobra positiva coberta por esta compra.
-                    new_avg = purchase_cost / op.amount
-                positions[ticker] = [(new_qty, new_avg)]
-            elif new_qty < 0:
-                positions[ticker] = [(new_qty, Decimal("0"))]
+                    positions[ticker] = []
+                continue
+
+            purchase_cost = buy_value + op.allocated_fee
+            new_qty = current_qty + op.amount
+            if current_qty > 0:
+                current_cost = current_qty * current_avg
+                new_avg = (current_cost + purchase_cost) / new_qty
             else:
-                positions[ticker] = []
+                new_avg = purchase_cost / op.amount
+            positions[ticker] = [(new_qty, new_avg)]
 
         elif op.transaction_type == "sell":
             sale_value  = op.unit_price * op.amount
@@ -2453,37 +2491,42 @@ def process_results(
                 else (Decimal(0), Decimal(0))
             )
 
-            qty_available = current_qty if current_qty > 0 else Decimal(0)
-            qty_costed = min(op.amount, qty_available)
-            cost_total = qty_costed * current_avg
-            new_qty = current_qty - op.amount
+            if current_qty > 0:
+                sell_from_long_qty = min(op.amount, current_qty)
+                short_qty = op.amount - sell_from_long_qty
 
-            if new_qty > 0:
-                positions[ticker] = [(new_qty, current_avg)]
-            elif new_qty < 0:
-                positions[ticker] = [(new_qty, Decimal("0"))]
-            else:
-                positions[ticker] = []
+                long_fee = op.allocated_fee * (sell_from_long_qty / op.amount) if op.amount else Decimal(0)
+                long_sale_value = op.unit_price * sell_from_long_qty
+                profit = long_sale_value - (sell_from_long_qty * current_avg) - long_fee
+                # A alienação do mês considera a venda inteira da nota; o P/L realizado
+                # considera apenas a parte que fechou posição comprada.
+                add_realized_result(op, profit, sale_value)
 
-            profit = sale_value - cost_total - op.allocated_fee
-
-            if op.category == "fii":
-                result_fii += profit
-
-            elif op.category == "swing":
-                # Separa o resultado pelo tipo do ativo para a regra de isenção
-                tipo = op.asset_type or ""
-
-                if tipo == ASSET_TYPE_ISENTO:
-                    vendas_isentos_swing += sale_value
-                elif tipo in ASSET_TYPES_COM_ISENCAO:
-                    # ON ou PN: acumula no resultado elegível à isenção
-                    result_swing_on_pn += profit
-                    vendas_on_pn       += sale_value  # volume de venda para cálculo de 20k
+                remaining_qty = current_qty - sell_from_long_qty
+                if short_qty > 0:
+                    short_fee = op.allocated_fee - long_fee
+                    short_sale_value = op.unit_price * short_qty
+                    short_avg = (short_sale_value - short_fee) / short_qty
+                    positions[ticker] = [(-short_qty, short_avg)]
+                elif remaining_qty > 0:
+                    positions[ticker] = [(remaining_qty, current_avg)]
                 else:
-                    # BDR, UNITS, ETF, ou tipo desconhecido: sempre tributável
-                    result_swing_outros += profit
-                    vendas_outros       += sale_value
+                    positions[ticker] = []
+                continue
+
+            # Venda descoberta: abre ou aumenta posição negativa sem realizar resultado.
+            current_short_qty = -current_qty if current_qty < 0 else Decimal(0)
+            new_short_qty = current_short_qty + op.amount
+            net_sale_value = sale_value - op.allocated_fee
+            if current_short_qty > 0:
+                current_net_sale_value = current_short_qty * current_avg
+                short_avg = (current_net_sale_value + net_sale_value) / new_short_qty
+            else:
+                short_avg = net_sale_value / op.amount
+            positions[ticker] = [(-new_short_qty, short_avg)]
+
+            # A alienação aconteceu na venda, mesmo que o resultado só seja realizado na recompra.
+            add_realized_result(op, Decimal(0), sale_value)
 
     # Processa Day Trade
     for _, ops_day in day_groups.items():
@@ -2513,18 +2556,13 @@ def process_results(
 
     irrf_day += irrf_day_from_notes
 
-    has_negative_positions = any(
-        sum(q for q, _ in lots) < 0
-        for lots in positions.values()
-    )
-
     return (
         result_swing_on_pn, result_swing_outros,
         result_day, result_fii,
         irrf_swing, irrf_day, irrf_fii,
         vendas_on_pn, vendas_outros,
         vendas_isentos_swing, vendas_isentos_day,
-        positions, has_negative_positions,
+        positions,
     )
 
 
@@ -2630,24 +2668,29 @@ def export_debug_excel(operations: List[Operation], output_path: str) -> None:
 # Funções de planilha Excel (resultado da apuração)
 ###############################################################################
 
-def resolve_month_sheet_name(workbook, expected_month: int, expected_year: int) -> str:
-    """Encontra a aba mensal aceitando MM.AA, MM.AAAA, MM/AA ou MM/AAAA."""
+def _month_sheet_matches(workbook, expected_month: int, expected_year: int) -> List[str]:
+    """Lista abas mensais que correspondem ao mês/ano informado."""
     matches: List[str] = []
-    pattern = re.compile(r"^\s*(\d{1,2})\s*[./]\s*(\d{2}|\d{4})\s*$")
+    pattern = re.compile(r"^\s*(\d{1,2})\s*[./-]\s*(\d{2}|\d{4})\s*$")
 
     for sheet_name in workbook.sheetnames:
         match = pattern.fullmatch(str(sheet_name))
         if not match:
             continue
-        month     = int(match.group(1))
+        month = int(match.group(1))
         year_text = match.group(2)
         if month != expected_month:
             continue
-        if len(year_text) == 2:
-            if int(year_text) == expected_year % 100:
-                matches.append(sheet_name)
-        elif int(year_text) == expected_year:
+        if len(year_text) == 2 and int(year_text) == expected_year % 100:
             matches.append(sheet_name)
+        elif len(year_text) == 4 and int(year_text) == expected_year:
+            matches.append(sheet_name)
+    return matches
+
+
+def resolve_month_sheet_name(workbook, expected_month: int, expected_year: int) -> str:
+    """Encontra a aba mensal aceitando MM.AA, MM.AAAA, MM/AA ou MM/AAAA."""
+    matches = _month_sheet_matches(workbook, expected_month, expected_year)
 
     if not matches:
         raise RuntimeError(
@@ -2660,6 +2703,187 @@ def resolve_month_sheet_name(workbook, expected_month: int, expected_year: int) 
             f"{', '.join(matches)}. Deixe apenas uma aba mensal correspondente."
         )
     return matches[0]
+
+
+def _copy_sheet_between_workbooks(source_sheet, target_workbook, target_title: str):
+    """Copia uma aba modelo para outro workbook preservando layout e imagens carregáveis."""
+    if target_title in target_workbook.sheetnames:
+        return target_workbook[target_title]
+
+    target_sheet = target_workbook.create_sheet(title=target_title)
+    target_sheet.sheet_format.defaultColWidth = source_sheet.sheet_format.defaultColWidth
+    target_sheet.sheet_format.defaultRowHeight = source_sheet.sheet_format.defaultRowHeight
+
+    for row in source_sheet.iter_rows():
+        for source_cell in row:
+            target_cell = target_sheet[source_cell.coordinate]
+            target_cell.value = source_cell.value
+            if source_cell.has_style:
+                target_cell._style = copy(source_cell._style)
+            if source_cell.number_format:
+                target_cell.number_format = source_cell.number_format
+            if source_cell.font:
+                target_cell.font = copy(source_cell.font)
+            if source_cell.fill:
+                target_cell.fill = copy(source_cell.fill)
+            if source_cell.border:
+                target_cell.border = copy(source_cell.border)
+            if source_cell.alignment:
+                target_cell.alignment = copy(source_cell.alignment)
+            if source_cell.protection:
+                target_cell.protection = copy(source_cell.protection)
+            if source_cell.comment:
+                target_cell.comment = deepcopy(source_cell.comment)
+
+    for merged_range in source_sheet.merged_cells.ranges:
+        target_sheet.merge_cells(str(merged_range))
+
+    for key, dim in source_sheet.row_dimensions.items():
+        target_dim = target_sheet.row_dimensions[key]
+        target_dim.height = dim.height
+        target_dim.hidden = dim.hidden
+        target_dim.outlineLevel = dim.outlineLevel
+        target_dim.collapsed = dim.collapsed
+        if dim.ht is not None:
+            target_dim.ht = dim.ht
+
+    for key, dim in source_sheet.column_dimensions.items():
+        target_dim = target_sheet.column_dimensions[key]
+        target_dim.width = dim.width
+        target_dim.min = dim.min
+        target_dim.max = dim.max
+        target_dim.hidden = dim.hidden
+        target_dim.outlineLevel = dim.outlineLevel
+        target_dim.collapsed = dim.collapsed
+        target_dim.bestFit = dim.bestFit
+
+    target_sheet.sheet_format = deepcopy(source_sheet.sheet_format)
+    target_sheet.sheet_properties = deepcopy(source_sheet.sheet_properties)
+    target_sheet.page_margins = deepcopy(source_sheet.page_margins)
+    target_sheet.page_setup = deepcopy(source_sheet.page_setup)
+    target_sheet.print_options = deepcopy(source_sheet.print_options)
+    target_sheet.freeze_panes = source_sheet.freeze_panes
+    target_sheet.sheet_view.showGridLines = source_sheet.sheet_view.showGridLines
+    target_sheet.sheet_view.zoomScale = source_sheet.sheet_view.zoomScale
+    target_sheet.sheet_view.zoomScaleNormal = source_sheet.sheet_view.zoomScaleNormal
+    target_sheet.sheet_view.view = source_sheet.sheet_view.view
+
+    if source_sheet.auto_filter:
+        target_sheet.auto_filter = deepcopy(source_sheet.auto_filter)
+    if source_sheet.print_area:
+        target_sheet.print_area = source_sheet.print_area
+    if source_sheet.data_validations:
+        target_sheet.data_validations = deepcopy(source_sheet.data_validations)
+    if source_sheet.conditional_formatting:
+        target_sheet.conditional_formatting = deepcopy(source_sheet.conditional_formatting)
+    if source_sheet.sheet_state:
+        target_sheet.sheet_state = source_sheet.sheet_state
+
+    for image in getattr(source_sheet, "_images", []):
+        target_sheet.add_image(deepcopy(image))
+
+    return target_sheet
+
+
+def _first_template_month_sheet(template_workbook, expected_month: int) -> Optional[str]:
+    """Encontra no padrão uma aba do mesmo mês, independentemente do ano."""
+    pattern = re.compile(r"^\s*(\d{1,2})\s*[./-]\s*(\d{2}|\d{4})\s*$")
+    for sheet_name in template_workbook.sheetnames:
+        match = pattern.fullmatch(str(sheet_name))
+        if match and int(match.group(1)) == expected_month:
+            return sheet_name
+    return None
+
+
+def _first_template_year_sheet(template_workbook) -> Optional[str]:
+    """Encontra a primeira aba anual do padrão."""
+    for sheet_name in template_workbook.sheetnames:
+        if re.fullmatch(r"\d{4}", str(sheet_name).strip()):
+            return sheet_name
+    return None
+
+
+def _sheet_is_empty(sheet) -> bool:
+    """Retorna True quando a aba não tem nenhum valor preenchido."""
+    for row in sheet.iter_rows():
+        for cell in row:
+            if cell.value not in (None, ""):
+                return False
+    return True
+
+
+def _remove_blank_default_sheet(workbook) -> None:
+    """Remove a aba padrão vazia de workbooks criados do zero."""
+    if len(workbook.sheetnames) <= 1:
+        return
+    default_sheet_pattern = re.compile(r"^(Sheet|Planilha)\d*$", re.IGNORECASE)
+    for title in list(workbook.sheetnames):
+        if not default_sheet_pattern.fullmatch(str(title).strip()):
+            continue
+        sheet = workbook[title]
+        if sheet.max_row == 1 and sheet.max_column == 1 and sheet["A1"].value is None:
+            del workbook[title]
+
+
+def ensure_required_apuracao_sheets(workbook, expected_month: int, expected_year: int) -> None:
+    """Cria as abas mensal e anual ausentes copiando de PADRAO_APURACAO.xlsx."""
+    needs_month = not _month_sheet_matches(workbook, expected_month, expected_year)
+    needs_year = str(expected_year) not in workbook.sheetnames
+    empty_year = (
+        not needs_year
+        and _sheet_is_empty(workbook[str(expected_year)])
+    )
+    if not needs_month and not needs_year and not empty_year:
+        return
+
+    template_path = get_data_path("PADRAO_APURACAO.xlsx")
+    if not os.path.exists(template_path):
+        raise RuntimeError(
+            f"A planilha padrão '{template_path}' não foi encontrada para criar abas ausentes."
+        )
+
+    template_workbook = openpyxl.load_workbook(template_path)
+
+    if needs_year or empty_year:
+        source_year_name = (
+            str(expected_year)
+            if str(expected_year) in template_workbook.sheetnames
+            else _first_template_year_sheet(template_workbook)
+        )
+        if not source_year_name:
+            raise RuntimeError("A planilha padrão não possui aba anual para copiar.")
+        if empty_year:
+            del workbook[str(expected_year)]
+        _copy_sheet_between_workbooks(
+            template_workbook[source_year_name],
+            workbook,
+            str(expected_year),
+        )
+
+    if needs_month:
+        source_month_name = None
+        try:
+            source_month_name = resolve_month_sheet_name(
+                template_workbook,
+                expected_month=expected_month,
+                expected_year=expected_year,
+            )
+        except RuntimeError:
+            source_month_name = _first_template_month_sheet(template_workbook, expected_month)
+
+        if not source_month_name:
+            raise RuntimeError(
+                f"A planilha padrão não possui aba modelo para o mês {expected_month:02d}."
+            )
+
+        target_month_name = f"{expected_month:02d}.{expected_year % 100:02d}"
+        _copy_sheet_between_workbooks(
+            template_workbook[source_month_name],
+            workbook,
+            target_month_name,
+        )
+
+    _remove_blank_default_sheet(workbook)
 
 
 def clear_month_output_cells(sheet) -> None:
@@ -2813,6 +3037,8 @@ def read_initial_portfolio_from_year_sheet(
                 avg_price = _to_decimal(sheet.cell(row=row, column=title_col + 2).value)
 
                 if ticker_str and qty is not None and avg_price is not None and qty != 0:
+                    if qty < 0:
+                        avg_price = abs(avg_price)
                     positions.setdefault(ticker_str, []).append((qty, avg_price))
 
                 row += 1
@@ -2851,7 +3077,7 @@ def write_portfolio_sheet_for_month(
 
         sheet.cell(row=row, column=1).value = ticker
         sheet.cell(row=row, column=2).value = float(total_qty)
-        sheet.cell(row=row, column=3).value = float(avg_price)
+        sheet.cell(row=row, column=3).value = float(abs(avg_price))
         sheet.cell(row=row, column=4).value = float(total_cost)
         row += 1
 
@@ -2867,7 +3093,7 @@ class ApuracaoB3App:
         self.master   = master
         self.base_dir = base_dir
 
-        self.master.title("Calculadora B3 - Notas de Corretagem                                             v 1.3")
+        self.master.title("Calculadora B3 - Notas de Corretagem                                           v 1.4")
         W, H = 550, 390
         self.master.geometry(f"{W}x{H}")
         self.master.resizable(False, False)
@@ -2926,7 +3152,7 @@ class ApuracaoB3App:
         tk.Entry(self.master, textvariable=self.cpf, width=54).place(x=x_entry, y=y)
 
         y += gap + 6
-        tk.Button(self.master, text="Selecione a pasta do mês", command=self._select_folder, width=23, height=1, font=("Segoe UI", 9, "bold")).place(x=x_label, y=y)
+        tk.Button(self.master, text="Selecione o(s) mês(es)", command=self._select_folder, width=23, height=1, font=("Segoe UI", 9, "bold")).place(x=x_label, y=y)
         tk.Entry(self.master, textvariable=self.selected_month_folder, width=54).place(x=x_entry, y=y)
 
         y += gap + 6
@@ -2952,9 +3178,19 @@ class ApuracaoB3App:
     # ── Seleção de arquivos/pastas ─────────────────────────────────────────────
 
     def _select_folder(self):
-        folder = filedialog.askdirectory(title="Selecione a pasta do mês da apuração")
-        if folder:
-            self.selected_month_folder.set(folder)
+        folders: List[str] = []
+        while True:
+            folder = filedialog.askdirectory(title="Selecione a pasta do mês da apuração")
+            if not folder:
+                break
+            folders.append(folder)
+            if not messagebox.askyesno(
+                "Adicionar outro mês?",
+                "Deseja selecionar outra pasta de mês para apurar em sequência?",
+            ):
+                break
+        if folders:
+            self.selected_month_folder.set("; ".join(folders))
 
     def _select_excel(self):
         file_path = filedialog.askopenfilename(
@@ -3568,17 +3804,78 @@ class ApuracaoB3App:
             messagebox.showerror("Erro ao exportar debug", str(exc))
             traceback.print_exc()
 
+    def _selected_month_folders(self) -> List[str]:
+        """Retorna as pastas selecionadas, aceitando separação por ponto e vírgula."""
+        raw = self.selected_month_folder.get().strip()
+        return [part.strip().strip('"') for part in raw.split(";") if part.strip()]
+
+    def _parse_month_folder_context(self, folder: str) -> Tuple[int, int, str]:
+        """Extrai mês/ano da pasta selecionada e retorna também o nome da aba anual."""
+        parts = os.path.normpath(folder).split(os.sep)
+        if len(parts) < 2:
+            raise ValueError(
+                "Caminho de pasta inválido. Estrutura esperada: .../<ANO>/<MM.AA>."
+            )
+
+        month_part = parts[-1]
+        year_part = parts[-2]
+
+        month_match = re.match(r"^\s*(\d{1,2})(?:\D+(\d{4}|\d{2}))?", month_part)
+        if not month_match:
+            raise ValueError(
+                f"O nome da pasta do mês ('{month_part}') é inválido. "
+                "Use o padrão 'MM.AA' ou 'MM.AAAA'. Textos após o ano são ignorados."
+            )
+
+        year_match = re.fullmatch(r"\s*(\d{4})\s*", year_part)
+        if year_match:
+            year = int(year_match.group(1))
+        elif month_match.group(2):
+            year_text = month_match.group(2)
+            year = 2000 + int(year_text) if len(year_text) == 2 else int(year_text)
+        else:
+            raise ValueError(
+                "Não foi possível identificar o ano da apuração pelo caminho da pasta. "
+                "Use uma estrutura como '.../2025/06.25' ou uma pasta de mês com ano, como '06.25' ou '06.2025'."
+            )
+
+        month = int(month_match.group(1))
+        if month < 1 or month > 12:
+            raise ValueError(f"O mês '{month:02d}' é inválido.")
+
+        return month, year, str(year)
+
+    def _resolve_operation_tickers(self, operations: List[Operation]) -> None:
+        """Normaliza ou solicita tickers ausentes nas operações extraídas."""
+        for op in operations:
+            if op.ticker and str(op.ticker).strip():
+                op.ticker = normalize_b3_ticker(op.ticker)
+                continue
+            key = op.name
+            if key in self.ticker_map:
+                op.ticker = normalize_b3_ticker(self.ticker_map[key])
+                continue
+            t = self._pedir_ticker(op.note_file, op.ref_date, op.name)
+            if not t:
+                raise RuntimeError(
+                    f"Apuração cancelada: ticker não informado para '{op.name}'."
+                )
+            t = normalize_b3_ticker(t) or ""
+            self.ticker_map[key] = t
+            self._save_ticker_map()
+            op.ticker = t
+
     # ── Execução principal da apuração ────────────────────────────────────────
 
     def _run_apuracao(self):
         """Orquestra todo o fluxo: leitura → tipo de ativo → classificação → cálculo → Excel."""
         name        = self.investor_name.get().strip()
         cpf         = self.cpf.get().strip()
-        folder      = self.selected_month_folder.get().strip()
+        folders     = self._selected_month_folders()
         excel_path  = self.selected_excel_path.get().strip()
         cpf_limpo   = re.sub(r"[^\d]", "", cpf)
 
-        if not name or not cpf_limpo or not folder or not excel_path:
+        if not name or not cpf_limpo or not folders or not excel_path:
             messagebox.showwarning("Campos pendentes", "Preencha todos os campos antes de calcular.")
             return
 
@@ -3599,146 +3896,157 @@ class ApuracaoB3App:
                 messagebox.showwarning("CPF inválido", "O CPF informado é inválido.")
                 return
 
-            parts = os.path.normpath(folder).split(os.sep)
-            if len(parts) < 2:
-                raise ValueError(
-                    "Caminho de pasta inválido. Estrutura esperada: .../<ANO>/<MM.AA>."
+            month_contexts = []
+            for folder in folders:
+                if not os.path.isdir(folder):
+                    raise ValueError(f"Pasta inválida: {folder}")
+                expected_month, year, year_sheet_name = self._parse_month_folder_context(folder)
+                month_contexts.append(
+                    {
+                        "folder": folder,
+                        "month": expected_month,
+                        "year": year,
+                        "year_sheet_name": year_sheet_name,
+                    }
                 )
 
-            month_part = parts[-1]
-            year_part  = parts[-2]
-
-            month_match = re.match(r"^\s*(\d{1,2})(?:[./](\d{2}|\d{4}))?\s*$", month_part)
-            if not month_match:
-                raise ValueError(
-                    f"O nome da pasta do mês ('{month_part}') é inválido. "
-                    "Use o padrão 'MM.AA' ou 'MM.AAAA'."
+            years = {ctx["year"] for ctx in month_contexts}
+            if len(years) != 1:
+                raise RuntimeError(
+                    "Não é permitido apurar meses de anos diferentes juntos. "
+                    "Selecione apenas pastas do mesmo ano, pois a planilha de apuração é anual."
                 )
 
-            year_digits = re.sub(r"[^0-9]", "", year_part)
-            if year_digits:
-                year = int(year_digits)
-            elif month_match.group(2):
-                year_text = month_match.group(2)
-                year = 2000 + int(year_text) if len(year_text) == 2 else int(year_text)
-            else:
-                raise ValueError(
-                    "Não foi possível identificar o ano da apuração pelo caminho da pasta. "
-                    "Use uma estrutura como '.../2025/06.25' ou selecione uma pasta chamada '06.25'."
+            selected_months = [ctx["month"] for ctx in month_contexts]
+            duplicated_months = sorted(
+                {
+                    month
+                    for month in selected_months
+                    if selected_months.count(month) > 1
+                }
+            )
+            if duplicated_months:
+                months_text = ", ".join(f"{month:02d}" for month in duplicated_months)
+                raise RuntimeError(
+                    f"O mesmo mês foi selecionado mais de uma vez: {months_text}. "
+                    "Remova a pasta duplicada e tente novamente."
                 )
 
-            expected_month = int(month_match.group(1))
-            if expected_month < 1 or expected_month > 12:
-                raise ValueError(f"O mês '{expected_month:02d}' é inválido.")
-
+            month_contexts.sort(key=lambda ctx: ctx["month"])
+            year = month_contexts[0]["year"]
             year_sheet_name = str(year)
 
             workbook   = openpyxl.load_workbook(excel_path)
-            sheet_name = resolve_month_sheet_name(workbook, expected_month=expected_month, expected_year=year)
+            for ctx in month_contexts:
+                ensure_required_apuracao_sheets(
+                    workbook,
+                    expected_month=ctx["month"],
+                    expected_year=ctx["year"],
+                )
+                ctx["sheet_name"] = resolve_month_sheet_name(
+                    workbook,
+                    expected_month=ctx["month"],
+                    expected_year=ctx["year"],
+                )
 
             if year_sheet_name not in workbook.sheetnames:
                 raise RuntimeError(
                     f"A aba anual '{year_sheet_name}' não foi encontrada na planilha."
                 )
 
-            # 1. Lê as notas (Camada 1 → Camada 2)
-            self.status_label.config(text="Lendo notas de corretagem...")
-            operations = parse_month_folder(
-                month_folder=folder,
-                expected_year=year,
-                expected_month=expected_month,
-                expected_cpf_digits=cpf_limpo,
-                password_map=self.password_map,
-                ask_password_cb=self._pedir_senha_pdf,
-                ask_manual_review_cb=self._revisao_manual_nota,
-            )
-
-            # 2. Resolve tickers ausentes
-            for op in operations:
-                if op.ticker and str(op.ticker).strip():
-                    op.ticker = normalize_b3_ticker(op.ticker)
-                    continue
-                key = op.name
-                if key in self.ticker_map:
-                    op.ticker = normalize_b3_ticker(self.ticker_map[key])
-                    continue
-                t = self._pedir_ticker(op.note_file, op.ref_date, op.name)
-                if not t:
-                    raise RuntimeError(
-                        f"Apuração cancelada: ticker não informado para '{op.name}'."
-                    )
-                t = normalize_b3_ticker(t) or ""
-                self.ticker_map[key] = t
-                self._save_ticker_map()
-                op.ticker = t
-
-            # 3. Detecta / solicita o tipo de ativo de cada operação
-            self.status_label.config(text="Identificando tipo dos ativos...")
-            self.resolve_asset_types(operations)
-
-            # 4. Classifica (day / swing / fii)
-            classify_operations(operations)
-
-            # Guarda para exportação de debug
-            self._last_operations = operations
-            self.btn_debug.config(state="normal")
-
-            # 5. Lê carteira anterior
+            all_operations: List[Operation] = []
             self.status_label.config(text="Lendo carteira do mês anterior...")
-            initial_positions = read_initial_portfolio_from_year_sheet(
+            current_positions = read_initial_portfolio_from_year_sheet(
                 workbook, year_sheet_name=year_sheet_name
             )
 
-            # 6. Calcula resultados (agora com separação por tipo)
-            self.status_label.config(text="Calculando resultados e carteira...")
-            (
-                result_swing_on_pn, result_swing_outros,
-                result_day, result_fii,
-                irrf_swing, irrf_day, irrf_fii,
-                vendas_on_pn, vendas_outros,
-                vendas_isentos_swing, vendas_isentos_day,
-                updated_positions, has_negative_positions,
-            ) = process_results(operations, initial_positions)
+            summaries = []
+            for ctx in month_contexts:
+                expected_month = ctx["month"]
+                sheet_name = ctx["sheet_name"]
+                folder = ctx["folder"]
 
-            # 7. Atualiza planilha Excel
-            self.status_label.config(text="Atualizando planilha Excel...")
-            update_month_sheet(
-                workbook,
-                sheet_name=sheet_name,
-                name=name,
-                cpf=cpf_limpo,
-                result_swing_on_pn=result_swing_on_pn,
-                result_swing_outros=result_swing_outros,
-                result_day=result_day,
-                result_fii=result_fii,
-                irrf_swing=irrf_swing,
-                irrf_day=irrf_day,
-                irrf_fii=irrf_fii,
-                vendas_on_pn=vendas_on_pn,
-                vendas_outros=vendas_outros,
-                vendas_isentos_swing=vendas_isentos_swing,
-                vendas_isentos_day=vendas_isentos_day,
-            )
-
-            write_portfolio_sheet_for_month(
-                workbook, month_sheet_name=sheet_name, positions=updated_positions
-            )
-            workbook.save(excel_path)
-
-            if has_negative_positions:
-                messagebox.showwarning(
-                    "Atenção - Carteira com quantidade negativa",
-                    "Há quantidades negativas na carteira calculada.\n"
-                    "Verifique se todas as notas foram importadas corretamente.",
+                self.status_label.config(
+                    text=f"Lendo notas de corretagem de {expected_month:02d}/{year}..."
+                )
+                operations = parse_month_folder(
+                    month_folder=folder,
+                    expected_year=year,
+                    expected_month=expected_month,
+                    expected_cpf_digits=cpf_limpo,
+                    password_map=self.password_map,
+                    ask_password_cb=self._pedir_senha_pdf,
+                    ask_manual_review_cb=self._revisao_manual_nota,
                 )
 
+                self._resolve_operation_tickers(operations)
+
+                self.status_label.config(
+                    text=f"Identificando tipo dos ativos de {expected_month:02d}/{year}..."
+                )
+                self.resolve_asset_types(operations)
+                classify_operations(operations)
+                all_operations.extend(operations)
+
+                self.status_label.config(
+                    text=f"Calculando resultados de {expected_month:02d}/{year}..."
+                )
+                (
+                    result_swing_on_pn, result_swing_outros,
+                    result_day, result_fii,
+                    irrf_swing, irrf_day, irrf_fii,
+                    vendas_on_pn, vendas_outros,
+                    vendas_isentos_swing, vendas_isentos_day,
+                    current_positions,
+                ) = process_results(operations, current_positions)
+
+                self.status_label.config(
+                    text=f"Atualizando planilha de {sheet_name}..."
+                )
+                update_month_sheet(
+                    workbook,
+                    sheet_name=sheet_name,
+                    name=name,
+                    cpf=cpf_limpo,
+                    result_swing_on_pn=result_swing_on_pn,
+                    result_swing_outros=result_swing_outros,
+                    result_day=result_day,
+                    result_fii=result_fii,
+                    irrf_swing=irrf_swing,
+                    irrf_day=irrf_day,
+                    irrf_fii=irrf_fii,
+                    vendas_on_pn=vendas_on_pn,
+                    vendas_outros=vendas_outros,
+                    vendas_isentos_swing=vendas_isentos_swing,
+                    vendas_isentos_day=vendas_isentos_day,
+                )
+
+                write_portfolio_sheet_for_month(
+                    workbook, month_sheet_name=sheet_name, positions=current_positions
+                )
+                summaries.append(
+                    (
+                        sheet_name,
+                        result_swing_on_pn + result_swing_outros,
+                        result_day,
+                        result_fii,
+                    )
+                )
+
+            self._last_operations = all_operations
+            self.btn_debug.config(state="normal")
+            workbook.save(excel_path)
+
+            summary_text = "\n".join(
+                (
+                    f"{sheet}: Swing {fmt(swing)} | Day {fmt(day)} | FII {fmt(fii)}"
+                    for sheet, swing, day, fii in summaries
+                )
+            )
             self.status_label.config(
                 text=(
-                    f"Apuração de {sheet_name} concluída\n"
-                    f"\n"
-                    f"Resultado Swing Trade: {fmt(result_swing_on_pn + result_swing_outros)}\n"
-                    f"Resultado Day Trade: {fmt(result_day)}\n"
-                    f"Resultado FII: {fmt(result_fii)}"
+                    f"Apuração concluída de {len(month_contexts)} mês(es):\n"
+                    f"{summary_text}"
                 )
             )
 
