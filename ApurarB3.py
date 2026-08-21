@@ -177,7 +177,7 @@ FEE_LABEL_PATTERNS = {
         r"Taxa\s+de\s+Registro",
     ],
     "transfer_fee": [
-        r"Taxa\s+de\s+(?:Transfer[eê]ncia|Tranfer[eê]ncia|Transf\.?)\s+de\s+Ativos",
+        r"Taxas?\s+de\s+(?:Transfer[eê]ncias?|Tranfer[eê]ncias?|Transf\.?)\s+de\s+Ativos?",
     ],
     "emoluments": [
         r"Emolumentos",
@@ -388,6 +388,20 @@ def normalize_b3_ticker(ticker: Optional[str]) -> Optional[str]:
     if re.fullmatch(r"[A-Z]{4}\d{1,2}F", ticker_upper):
         return ticker_upper[:-1]
     return ticker_upper
+
+
+def _extract_cv_from_b3_line(line: str) -> Optional[str]:
+    """Extrai C/V de linhas B3 em que a operação vem separada ou grudada em LISTADO."""
+    line_upper = (line or "").upper()
+
+    match = re.search(
+        r"\bB3\s+(?:RV|RF)\s+LISTAD(?:O\s+([CV])|([CV])O?|O([CV]))\b",
+        line_upper,
+    )
+    if match:
+        return next((group for group in match.groups() if group), None)
+
+    return None
 
 
 # Função auxiliar do orquestrador: identifica corretora para escolher parser específico.
@@ -1013,6 +1027,10 @@ def _try_fees_same_line(lines: List[str]) -> FinancialSummary:
         for field_name, patterns in FEE_LABEL_PATTERNS.items():
             if not _label_matches(line, patterns):
                 continue
+            label_match = next(
+                (re.search(pattern, line, re.IGNORECASE) for pattern in patterns if re.search(pattern, line, re.IGNORECASE)),
+                None,
+            )
             if field_name == "irrf" and re.search(r"base\s+R\$", line, re.IGNORECASE):
                 projection = re.search(r"Projeç[aã]o\s+R\$\s*([\d.,-]+)", line, re.IGNORECASE)
                 if projection:
@@ -1027,7 +1045,9 @@ def _try_fees_same_line(lines: List[str]) -> FinancialSummary:
                     continue
                 _set_summary_field(summary, field_name, value)
                 continue
-            value = _last_money_from_line(line)
+            if label_match is None:
+                continue
+            value = _last_money_from_line(line[label_match.end():])
             if value is None or value < 0:
                 continue
             normalized_line = re.sub(r"\s+", " ", line).strip().lower()
@@ -1385,7 +1405,9 @@ def _parse_generic_text_bovespa(pdf_path: str, password: Optional[str] = None) -
             continue
 
         # Só tenta linhas com indicação operacional e mercado Bovespa/B3.
-        if not re.search(r"\b[CV]\b", line_upper):
+        # Algumas notas Itaú extraem C/V grudado em LISTADO: LISTADCO/LISTADVO.
+        inline_cv = _extract_cv_from_b3_line(line_upper)
+        if not re.search(r"\b[CV]\b", line_upper) and inline_cv is None:
             continue
         if not re.search(r"BOVESPA|B3|VISTA|VIS|FRACION", line_upper):
             continue
@@ -1408,13 +1430,26 @@ def _parse_generic_text_bovespa(pdf_path: str, password: Optional[str] = None) -
                 break
 
         if cv_idx is None:
-            continue
+            for i, token in enumerate(tokens):
+                if _extract_cv_from_b3_line("B3 RV " + token):
+                    cv_idx = i
+                    break
+            if cv_idx is None or inline_cv is None:
+                continue
 
-        cv = tokens[cv_idx]
+        cv = tokens[cv_idx] if tokens[cv_idx] in ("C", "V") else inline_cv
         transaction_type = "buy" if cv == "C" else "sell"
 
         # Normalmente, após C/V vem o tipo de mercado (VISTA/VIS/FRACIONARIO).
-        name_tokens = tokens[cv_idx + 2:] if len(tokens) > cv_idx + 2 else tokens[cv_idx + 1:]
+        market_idx = None
+        for candidate_idx in range(cv_idx + 1, min(cv_idx + 5, len(tokens))):
+            if re.search(r"VISTA|VIS|FRACION", tokens[candidate_idx], re.IGNORECASE):
+                market_idx = candidate_idx
+                break
+        if market_idx is not None:
+            name_tokens = tokens[market_idx + 1:]
+        else:
+            name_tokens = tokens[cv_idx + 2:] if len(tokens) > cv_idx + 2 else tokens[cv_idx + 1:]
         name = " ".join(name_tokens).strip()
 
         # Tenta localizar ticker brasileiro dentro da descrição.
@@ -1490,7 +1525,7 @@ def _parse_generic_vertical_bovespa(pdf_path: str, password: Optional[str] = Non
     irrf_note = Decimal("0")
 
     rows: List[dict] = []
-    for start_mode in ("separate_cv", "leading_cv"):
+    for start_mode in ("separate_cv", "leading_cv", "inline_cv"):
         rows.extend(_parse_vertical_operation_blocks(
             lines=lines,
             ref_date=ref_date,
@@ -1551,7 +1586,7 @@ def _parse_generic_vertical_rows_by_page(
             if raw_line and raw_line.strip()
         ]
 
-        for start_mode in ("separate_cv", "leading_cv"):
+        for start_mode in ("separate_cv", "leading_cv", "inline_cv"):
             rows.extend(_parse_vertical_operation_blocks(
                 lines=lines,
                 ref_date=ref_date,
@@ -1601,11 +1636,10 @@ def _parse_vertical_operation_blocks(
         line_upper = lines[i].upper()
 
         if start_mode == "inline_cv":
-            start_match = re.search(r"\bB3\s+RV\s+LISTADO\s+([CV])\b", line_upper)
-            if not start_match:
+            cv = _extract_cv_from_b3_line(line_upper)
+            if cv is None:
                 i += 1
                 continue
-            cv = start_match.group(1)
             market_idx = i + 1
             name_idx = i + 2
         elif start_mode == "leading_cv":
@@ -2156,11 +2190,17 @@ def parse_month_folder(
             notes = result
             raw_text_for_quantity: Optional[str] = None
             fallback_rows_by_date: Optional[Dict[date, List[dict]]] = None
-            transfer_fee_pattern = r"Taxa\s+de\s+(?:Transfer[eê]ncia|Tranfer[eê]ncia|Transf\.?)\s+de\s+Ativos"
+            transfer_fee_pattern = r"Taxas?\s+de\s+(?:Transfer[eê]ncias?|Tranfer[eê]ncias?|Transf\.?)\s+de\s+Ativos?"
             transfer_fee_by_date = _extract_fee_by_ref_date_from_pdf(
                 pdf_path,
                 senha_arquivo,
                 transfer_fee_pattern,
+            )
+            taxes_pattern = r"^Impostos$|^ISS(?:\s*\([^)]*\))?$"
+            taxes_by_date = _extract_fee_by_ref_date_from_pdf(
+                pdf_path,
+                senha_arquivo,
+                taxes_pattern,
             )
             for note in notes:
                 corrected_amounts: List[Decimal] = []
@@ -2220,9 +2260,36 @@ def parse_month_folder(
                         transfer_fee_pattern,
                     )
 
+                taxes_note = taxes_by_date.get(note.reference_date, Decimal("0"))
+
+                if note.reference_date not in taxes_by_date:
+                    taxes_note = _extract_fee_from_label_line(
+                        raw_text_for_quantity,
+                        taxes_pattern,
+                    )
+
+                if taxes_note == 0 and note.reference_date not in taxes_by_date:
+                    taxes_note = _extract_fee_near_label(
+                        [
+                            re.sub(r"\s+", " ", line).strip()
+                            for line in raw_text_for_quantity.splitlines()
+                            if line and line.strip()
+                        ],
+                        taxes_pattern,
+                    ) 
+
+                note_taxes = getattr(note, "taxes", Decimal("0")) or Decimal("0")
                 total_fees = (
-                    note.settlement_fee + note.registration_fee + note.ana_fee
-                    + note.emoluments + transfer_fee_note + note.operational_fee + note.others
+                    (getattr(note, "settlement_fee", Decimal("0")) or Decimal("0"))
+                    + (getattr(note, "registration_fee", Decimal("0")) or Decimal("0"))
+                    + transfer_fee_note
+                    + (getattr(note, "emoluments", Decimal("0")) or Decimal("0"))
+                    + (getattr(note, "ana_fee", Decimal("0")) or Decimal("0"))
+                    + (getattr(note, "operational_fee", Decimal("0")) or Decimal("0"))
+                    + (getattr(note, "execution", Decimal("0")) or Decimal("0"))
+                    + (getattr(note, "custody_fee", Decimal("0")) or Decimal("0"))
+                    + (note_taxes if note_taxes != 0 else taxes_note)
+                    + (getattr(note, "others", Decimal("0")) or Decimal("0"))
                 )
                 note_irrf = getattr(note, "irrf", Decimal("0")) or Decimal("0")
 
@@ -2283,60 +2350,89 @@ def parse_month_folder(
 def classify_operations(ops: List[Operation]) -> None:
     """Classifica cada operação como 'day', 'fii' ou 'swing'.
 
-    Agrupa por (note_file, ref_date, ticker). Compra e venda da MESMA ação
-    em notas DIFERENTES NÃO é detectado como day trade (comportamento intencional).
+    - FII/FIAGRO SEMPRE vai para categoria 'fii', mesmo que tenha compra e venda no mesmo dia.
+    - Somente ativos que NÃO são FII/FIAGRO entram na análise de day trade.
+    
+    Agrupa por (note_file, ref_date, ticker). Compra e venda da MESMA ação em notas DIFERENTES NÃO é detectado como day trade (definido assim, conforme solicitado).
 
-    Quando há day trade parcial, divide a operação em duas:
-    parte "day" e parte "swing"/"fii".
+    Quando há day trade parcial, divide a operação em duas: parte "day" e parte "swing".
     """
     new_ops: List[Operation] = []
 
     group_map: Dict[Tuple[str, date, str], List[Operation]] = {}
+
     for op in ops:
         op.ticker = normalize_b3_ticker(op.ticker)
-        key = (op.note_file, op.ref_date, op.ticker)
+        ticker_key = op.ticker or ""
+        key = (op.note_file, op.ref_date, ticker_key)
         group_map.setdefault(key, []).append(op)
 
     for _, group_ops in group_map.items():
+        # ── 1. Primeiro verifica se o grupo é FII/FIAGRO ─────────────────────
+        # Se for FII/FIAGRO, não entra em day trade. Vai tudo para B49 pela categoria "fii".
+        group_is_fii = any(
+            o.asset_type in (ASSET_TYPE_FII, ASSET_TYPE_FIAGRO)
+            or is_fii(o.name, o.ticker)
+            for o in group_ops
+        )
+
+        if group_is_fii:
+            for o in group_ops:
+                if o.amount <= 0:
+                    continue
+                o.category = "fii"
+                new_ops.append(o)
+
+            # Não processa day trade para FII/FIAGRO
+            continue
+
+        # ── 2. Se NÃO for FII/FIAGRO, aí sim verifica day trade ───────────────
         buys  = [o for o in group_ops if o.transaction_type == "buy"]
         sells = [o for o in group_ops if o.transaction_type == "sell"]
 
-        qty_day = min(sum(o.amount for o in buys), sum(o.amount for o in sells))
+        qty_day = min(
+            sum(o.amount for o in buys),
+            sum(o.amount for o in sells),
+        )
 
         if qty_day > 0:
             for ops_side in (buys, sells):
                 remaining = qty_day
+
                 for o in ops_side:
                     if remaining <= 0:
                         break
+
                     q = min(o.amount, remaining)
+
                     if q <= 0:
                         continue
+
                     ratio = q / o.amount if o.amount else Decimal(0)
+
                     day_op = deepcopy(o)
-                    day_op.amount       = q
-                    day_op.total_value  = q * o.unit_price
+                    day_op.amount        = q
+                    day_op.total_value   = q * o.unit_price
                     day_op.allocated_fee = o.allocated_fee * ratio
-                    day_op.irrf         = (o.irrf or Decimal(0)) * ratio
-                    day_op.category     = "day"
+                    day_op.irrf          = (o.irrf or Decimal(0)) * ratio
+                    day_op.category      = "day"
+
                     new_ops.append(day_op)
-                    o.amount       -= q
-                    o.total_value   = o.amount * o.unit_price
+
+                    # Reduz a operação original para sobrar somente a parte swing
+                    o.amount        -= q
+                    o.total_value    = o.amount * o.unit_price
                     o.allocated_fee -= day_op.allocated_fee
-                    o.irrf          = (o.irrf or Decimal(0)) - day_op.irrf
+                    o.irrf           = (o.irrf or Decimal(0)) - day_op.irrf
+
                     remaining -= q
 
+        # ── 3. O restante, se houver, vira swing ──────────────────────────────
         for o in group_ops:
             if o.amount <= 0:
                 continue
-            o.category = (
-                "fii"
-                if (
-                    o.asset_type in (ASSET_TYPE_FII, ASSET_TYPE_FIAGRO)
-                    or (o.asset_type != ASSET_TYPE_ISENTO and is_fii(o.name, o.ticker))
-                )
-                else "swing"
-            )
+
+            o.category = "swing"
             new_ops.append(o)
 
     ops.clear()
@@ -3093,7 +3189,7 @@ class ApuracaoB3App:
         self.master   = master
         self.base_dir = base_dir
 
-        self.master.title("Calculadora B3 - Notas de Corretagem                                           v 1.4")
+        self.master.title("Calculadora B3 - Notas de Corretagem                                           v 1.5")
         W, H = 550, 390
         self.master.geometry(f"{W}x{H}")
         self.master.resizable(False, False)
