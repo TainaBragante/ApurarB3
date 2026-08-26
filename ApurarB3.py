@@ -344,7 +344,7 @@ def detect_asset_type(name: str, ticker: Optional[str]) -> Optional[str]:
 
     # ── 3. BDR / DRN ─────────────────────────────────────────────────────────
     # Tickers terminados em 34 (Nível III) ou 33 (Nível I/II) e/ou contêm "BDR"/"DRN" no nome.
-    if re.search(r"\d{2}(33|34)$", ticker_upper):
+    if re.search(r"(?:33|34)$", ticker_upper):
         return ASSET_TYPE_BDR
     if re.search(r"\bBDR\b|\bDRN\b", name_upper):
         return ASSET_TYPE_BDR
@@ -1362,24 +1362,6 @@ def _parse_generic_text_bovespa(pdf_path: str, password: Optional[str] = None) -
     - Futuros/BMF/WIN/WDO devem ter parser próprio, pois o cálculo tributário é diferente.
     """
     filename = os.path.basename(pdf_path)
-    text = _extract_text_from_pdf(pdf_path, password=password)
-
-    ref_date = _extract_ref_date_from_text(text)
-    cpf_digits = _extract_cpf_from_text(text)
-
-    lines = [
-        re.sub(r"\s+", " ", raw_line).strip()
-        for raw_line in text.splitlines()
-        if raw_line and raw_line.strip()
-    ]
-
-    settlement_fee = Decimal("0")
-    registration_fee = Decimal("0")
-    transfer_fee = Decimal("0")
-    ana_fee = Decimal("0")
-    emoluments = Decimal("0")
-    other_fee = Decimal("0")
-    irrf_note = Decimal("0")
 
     money = r"(?:R\$\s*)?(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2,6}"
     qty   = r"\d{1,12}(?:\.\d{3})*"
@@ -1393,110 +1375,132 @@ def _parse_generic_text_bovespa(pdf_path: str, password: Optional[str] = None) -
 
     rows: List[dict] = []
 
-    for raw_line in text.splitlines():
-        line = re.sub(r"\s+", " ", raw_line).strip()
-        if not line:
+    doc = fitz.open(pdf_path)
+    if password:
+        try:
+            doc.authenticate(password)
+        except Exception:
+            pass
+
+    for page in doc:
+        page_text = page.get_text("text")
+        try:
+            ref_date = _extract_ref_date_from_text(page_text)
+        except RuntimeError:
             continue
 
-        line_upper = line.upper()
+        cpf_digits = _extract_cpf_from_text(page_text)
+        lines = [
+            re.sub(r"\s+", " ", raw_line).strip()
+            for raw_line in page_text.splitlines()
+            if raw_line and raw_line.strip()
+        ]
 
-        # Ignora linhas de resumo/rodapé.
-        if any(x in line_upper for x in ("SUBTOTAL", "RESUMO", "TOTAL", "LIQUIDO", "LÍQUIDO")):
-            continue
+        page_rows: List[dict] = []
+        for line in lines:
+            line_upper = line.upper()
 
-        # Só tenta linhas com indicação operacional e mercado Bovespa/B3.
-        # Algumas notas Itaú extraem C/V grudado em LISTADO: LISTADCO/LISTADVO.
-        inline_cv = _extract_cv_from_b3_line(line_upper)
-        if not re.search(r"\b[CV]\b", line_upper) and inline_cv is None:
-            continue
-        if not re.search(r"BOVESPA|B3|VISTA|VIS|FRACION", line_upper):
-            continue
-
-        # Evita tentar interpretar futuros/BMF no parser genérico de ações.
-        if re.search(r"\b(WIN|WDO|IND|DOL)\b|BM&F|BMF|FUTURO", line_upper):
-            continue
-
-        match = end_pattern.search(line_upper)
-        if not match:
-            continue
-
-        before = match.group("before").strip()
-        tokens = before.split()
-
-        cv_idx = None
-        for i, token in enumerate(tokens):
-            if token in ("C", "V"):
-                cv_idx = i
-                break
-
-        if cv_idx is None:
-            for i, token in enumerate(tokens):
-                if _extract_cv_from_b3_line("B3 RV " + token):
-                    cv_idx = i
-                    break
-            if cv_idx is None or inline_cv is None:
+            # Ignora linhas de resumo/rodapé.
+            if any(x in line_upper for x in ("SUBTOTAL", "RESUMO", "TOTAL", "LIQUIDO", "LÍQUIDO")):
                 continue
 
-        cv = tokens[cv_idx] if tokens[cv_idx] in ("C", "V") else inline_cv
-        transaction_type = "buy" if cv == "C" else "sell"
+            # Só tenta linhas com indicação operacional e mercado Bovespa/B3.
+            # Algumas notas Itaú extraem C/V grudado em LISTADO: LISTADCO/LISTADVO.
+            inline_cv = _extract_cv_from_b3_line(line_upper)
+            if not re.search(r"\b[CV]\b", line_upper) and inline_cv is None:
+                continue
+            if not re.search(r"BOVESPA|B3|VISTA|VIS|FRACION", line_upper):
+                continue
 
-        # Normalmente, após C/V vem o tipo de mercado (VISTA/VIS/FRACIONARIO).
-        market_idx = None
-        for candidate_idx in range(cv_idx + 1, min(cv_idx + 5, len(tokens))):
-            if re.search(r"VISTA|VIS|FRACION", tokens[candidate_idx], re.IGNORECASE):
-                market_idx = candidate_idx
-                break
-        if market_idx is not None:
-            name_tokens = tokens[market_idx + 1:]
-        else:
-            name_tokens = tokens[cv_idx + 2:] if len(tokens) > cv_idx + 2 else tokens[cv_idx + 1:]
-        name = " ".join(name_tokens).strip()
+            # Evita tentar interpretar futuros/BMF no parser genérico de ações.
+            if re.search(r"\b(WIN|WDO|IND|DOL)\b|BM&F|BMF|FUTURO", line_upper):
+                continue
 
-        # Tenta localizar ticker brasileiro dentro da descrição.
-        ticker_match = re.search(r"\b[A-Z]{4}\d{1,2}[A-Z]?\b", name)
-        ticker = normalize_b3_ticker(ticker_match.group(0)) if ticker_match else None
+            match = end_pattern.search(line_upper)
+            if not match:
+                continue
 
-        amount = _parse_integer_br(match.group("amount"))
-        unit_price = _parse_decimal_br(match.group("unit"))
-        total_value = _parse_decimal_br(match.group("total"))
+            before = match.group("before").strip()
+            tokens = before.split()
 
-        if amount is None or amount <= 0 or unit_price is None or unit_price <= 0:
-            continue
+            cv_idx = None
+            for i, token in enumerate(tokens):
+                if token in ("C", "V"):
+                    cv_idx = i
+                    break
 
-        if total_value is None or total_value <= 0:
-            total_value = amount * unit_price
+            if cv_idx is None:
+                for i, token in enumerate(tokens):
+                    if _extract_cv_from_b3_line("B3 RV " + token):
+                        cv_idx = i
+                        break
+                if cv_idx is None or inline_cv is None:
+                    continue
 
-        if not name:
-            name = ticker or "ATIVO NAO IDENTIFICADO"
+            cv = tokens[cv_idx] if tokens[cv_idx] in ("C", "V") else inline_cv
+            transaction_type = "buy" if cv == "C" else "sell"
 
-        rows.append({
-            "ref_date": ref_date,
-            "ticker": ticker,
-            "name": name,
-            "transaction_type": transaction_type,
-            "amount": amount,
-            "unit_price": unit_price,
-            "total_value": total_value,
-            "settlement_fee_note": settlement_fee,
-            "emoluments_note": emoluments,
-            "registration_fee_note": registration_fee,
-            "transfer_fee_note": transfer_fee,
-            "ana_fee_note": ana_fee,
-            "other_fee_note": other_fee,
-            "irrf": irrf_note,
-            "cpf": cpf_digits,
-        })
+            # Normalmente, após C/V vem o tipo de mercado (VISTA/VIS/FRACIONARIO).
+            market_idx = None
+            for candidate_idx in range(cv_idx + 1, min(cv_idx + 5, len(tokens))):
+                if re.search(r"VISTA|VIS|FRACION", tokens[candidate_idx], re.IGNORECASE):
+                    market_idx = candidate_idx
+                    break
+            if market_idx is not None:
+                name_tokens = tokens[market_idx + 1:]
+            else:
+                name_tokens = tokens[cv_idx + 2:] if len(tokens) > cv_idx + 2 else tokens[cv_idx + 1:]
+            name = " ".join(name_tokens).strip()
+
+            # Tenta localizar ticker brasileiro dentro da descrição.
+            ticker_match = re.search(r"\b[A-Z]{4}\d{1,2}[A-Z]?\b", name)
+            ticker = normalize_b3_ticker(ticker_match.group(0)) if ticker_match else None
+
+            amount = _parse_integer_br(match.group("amount"))
+            unit_price = _parse_decimal_br(match.group("unit"))
+            total_value = _parse_decimal_br(match.group("total"))
+
+            if amount is None or amount <= 0 or unit_price is None or unit_price <= 0:
+                continue
+
+            if total_value is None or total_value <= 0:
+                total_value = amount * unit_price
+
+            if not name:
+                name = ticker or "ATIVO NAO IDENTIFICADO"
+
+            page_rows.append({
+                "ref_date": ref_date,
+                "ticker": ticker,
+                "name": name,
+                "transaction_type": transaction_type,
+                "amount": amount,
+                "unit_price": unit_price,
+                "total_value": total_value,
+                "settlement_fee_note": Decimal("0"),
+                "emoluments_note": Decimal("0"),
+                "registration_fee_note": Decimal("0"),
+                "transfer_fee_note": Decimal("0"),
+                "ana_fee_note": Decimal("0"),
+                "other_fee_note": Decimal("0"),
+                "irrf": Decimal("0"),
+                "cpf": cpf_digits,
+            })
+
+        if page_rows:
+            broker = _detect_broker(page_text)
+            _extract_and_apply_financial_summary(
+                page_rows,
+                lines,
+                broker=broker,
+                warning_prefix="[AVISO parser genérico]",
+            )
+            rows.extend(page_rows)
+
+    doc.close()
 
     if not rows:
         raise RuntimeError(f"Parser genérico tabular: nenhuma operação Bovespa encontrada em '{filename}'.")
-
-    broker = _detect_broker(text)
-    _extract_and_apply_financial_summary(
-        rows,
-        lines,
-        broker=broker,
-        warning_prefix="[AVISO parser genérico]",
-    )
 
     return rows
 
@@ -1506,50 +1510,59 @@ def _parse_generic_vertical_bovespa(pdf_path: str, password: Optional[str] = Non
     """Parser genérico vertical para notas em que as colunas saem como linhas separadas."""
 
     filename = os.path.basename(pdf_path)
-    text = _extract_text_from_pdf(pdf_path, password=password)
-    ref_date = _extract_ref_date_from_text(text)
-    cpf_digits = _extract_cpf_from_text(text)
-
-    lines = [
-        re.sub(r"\s+", " ", raw_line).strip()
-        for raw_line in text.splitlines()
-        if raw_line and raw_line.strip()
-    ]
-
-    settlement_fee = Decimal("0")
-    registration_fee = Decimal("0")
-    transfer_fee = Decimal("0")
-    ana_fee = Decimal("0")
-    emoluments = Decimal("0")
-    other_fee = Decimal("0")
-    irrf_note = Decimal("0")
-
     rows: List[dict] = []
-    for start_mode in ("separate_cv", "leading_cv", "inline_cv"):
-        rows.extend(_parse_vertical_operation_blocks(
-            lines=lines,
-            ref_date=ref_date,
-            cpf_digits=cpf_digits,
-            settlement_fee=settlement_fee,
-            registration_fee=registration_fee,
-            transfer_fee=transfer_fee,
-            ana_fee=ana_fee,
-            emoluments=emoluments,
-            other_fee=other_fee,
-            irrf_note=irrf_note,
-            start_mode=start_mode,
-        ))
+
+    doc = fitz.open(pdf_path)
+    if password:
+        try:
+            doc.authenticate(password)
+        except Exception:
+            pass
+
+    for page in doc:
+        page_text = page.get_text("text")
+        try:
+            ref_date = _extract_ref_date_from_text(page_text)
+        except RuntimeError:
+            continue
+
+        cpf_digits = _extract_cpf_from_text(page_text)
+        lines = [
+            re.sub(r"\s+", " ", raw_line).strip()
+            for raw_line in page_text.splitlines()
+            if raw_line and raw_line.strip()
+        ]
+
+        page_rows: List[dict] = []
+        for start_mode in ("separate_cv", "leading_cv", "inline_cv"):
+            page_rows.extend(_parse_vertical_operation_blocks(
+                lines=lines,
+                ref_date=ref_date,
+                cpf_digits=cpf_digits,
+                settlement_fee=Decimal("0"),
+                registration_fee=Decimal("0"),
+                transfer_fee=Decimal("0"),
+                ana_fee=Decimal("0"),
+                emoluments=Decimal("0"),
+                other_fee=Decimal("0"),
+                irrf_note=Decimal("0"),
+                start_mode=start_mode,
+            ))
+
+        if page_rows:
+            broker = _detect_broker(page_text)
+            _extract_and_apply_financial_summary(
+                page_rows,
+                lines,
+                broker=broker,
+                warning_prefix="[AVISO parser genérico]",
+            )
+            rows.extend(page_rows)
+
+    doc.close()
 
     if not rows:
         raise RuntimeError(f"Parser genérico vertical: nenhuma operação Bovespa encontrada em '{filename}'.")
-
-    broker = _detect_broker(text)
-    _extract_and_apply_financial_summary(
-        rows,
-        lines,
-        broker=broker,
-        warning_prefix="[AVISO parser genérico]",
-    )
 
     return rows
 
@@ -3941,21 +3954,53 @@ class ApuracaoB3App:
 
         return month, year, str(year)
 
+    def _ticker_map_key(self, name: str) -> str:
+        """
+        Normaliza a descrição do ativo para usar como chave do ticker_map.
+
+        Evita criar chaves diferentes para:
+            BOA SAFRA ON NM
+            BOA SAFRA ON NM @
+            BOA SAFRA ON NM @#
+        """
+        key = (name or "").upper().strip()
+
+        # Remove símbolos de observação que aparecem na nota.
+        key = re.sub(r"[@#]+", " ", key)
+
+        # Remove espaços duplicados.
+        key = re.sub(r"\s+", " ", key)
+
+        return key.strip()
+
     def _resolve_operation_tickers(self, operations: List[Operation]) -> None:
         """Normaliza ou solicita tickers ausentes nas operações extraídas."""
         for op in operations:
             if op.ticker and str(op.ticker).strip():
                 op.ticker = normalize_b3_ticker(op.ticker)
                 continue
-            key = op.name
+
+            raw_key = (op.name or "").strip()
+            key = self._ticker_map_key(op.name)
+
             if key in self.ticker_map:
                 op.ticker = normalize_b3_ticker(self.ticker_map[key])
                 continue
+
+            # Compatibilidade com mapas antigos salvos com nome bruto.
+            if raw_key in self.ticker_map:
+                op.ticker = normalize_b3_ticker(self.ticker_map[raw_key])
+
+                self.ticker_map[key] = op.ticker or self.ticker_map[raw_key]
+                self._save_ticker_map()
+                continue
+
             t = self._pedir_ticker(op.note_file, op.ref_date, op.name)
             if not t:
                 raise RuntimeError(
                     f"Apuração cancelada: ticker não informado para '{op.name}'."
                 )
+            
             t = normalize_b3_ticker(t) or ""
             self.ticker_map[key] = t
             self._save_ticker_map()
@@ -4135,7 +4180,7 @@ class ApuracaoB3App:
 
             summary_text = "\n".join(
                 (
-                    f"{sheet}: Swing {fmt(swing)} | Day {fmt(day)} | FII {fmt(fii)}"
+                    f"{sheet} - Swing: {fmt(swing)} | Day: {fmt(day)} | FII: {fmt(fii)}"
                     for sheet, swing, day, fii in summaries
                 )
             )
